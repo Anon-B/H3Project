@@ -404,17 +404,19 @@ def _dataset_rows(name,limit=10000,res=None):
            WHERE d.name=%s"""
     params=[name]
     if res is not None:sql+=" AND (h.resolution=%s OR h.resolution IS NULL)";params.append(res)
-    sql+=" ORDER BY e.entity_id,p.part_index,h.ring_id,h.h3_index LIMIT %s";params.append(limit*100)
+    sql+=" ORDER BY e.entity_id,p.part_index,h.ring_id,h.h3_index"
+    if limit>0:
+        sql+=" LIMIT %s";params.append(limit*100)
     with db_conn() as c:
         with c.cursor() as cur:cur.execute(sql,params);return cur.fetchall()
 
 @app.post("/ingestion/dataset/preview")
 def ingestion_dataset_preview(body:dict=Body(...)):
-    name=str(body.get("dataset","")).strip();limit=int(body.get("limit",10000))
+    name=str(body.get("dataset","")).strip();limit=int(body.get("limit",0))
     res=int(body.get("resolution",11))
     if not name:raise HTTPException(400,"dataset is required")
     if not 5<=res<=15:raise HTTPException(400,"resolution must be 5..15")
-    rows=_dataset_rows(name,min(limit,10000),res)
+    rows=_dataset_rows(name,max(0,limit),res)
     if not rows:raise HTTPException(404,"dataset not found or empty")
     entities={};features=[]
     for x in rows:
