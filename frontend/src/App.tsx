@@ -24,7 +24,7 @@ export default function App(){
  const [h3Visible,setH3Visible]=useState(true),[entityVisible,setEntityVisible]=useState(true),[resultOpen,setResultOpen]=useState(false),[results,setResults]=useState<any[]>([]);
  const [dark,setDark]=useState(localStorage.getItem('h3-theme')==='dark'),[basemap,setBasemap]=useState(localStorage.getItem('h3-basemap')||'liberty');
  const [stats,setStats]=useState(false),[toast,setToast]=useState('');
- const [colors,setColors]=useState({entity:'#2563eb',fill:'#2563eb',line:'#1d4ed8',opacity:.13});
+ const [colors,setColors]=useState(()=>({entity:localStorage.getItem('h3-entity-color')||'#2563eb',fill:localStorage.getItem('h3-h3-color')||'#2563eb',line:localStorage.getItem('h3-h3-line-color')||'#1d4ed8',opacity:Number(localStorage.getItem('h3-h3-opacity')||13)/100}));
  const [ingMode,setIngMode]=useState<'file'|'draw'>('file'),[ingName,setIngName]=useState(''),[ingRes,setIngRes]=useState(11),[ingData,setIngData]=useState<FeatureCollection|null>(null),[preview,setPreview]=useState<any>(null);
  const notify=(x:string)=>{setToast(x);setTimeout(()=>setToast(''),2200)};
  const refresh=useCallback(async()=>{try{const d=await fetch(API+'/ingestion/datasets').then(r=>r.json());setDatasets(d.datasets||[])}catch{notify('API unavailable')}},[]);
@@ -35,7 +35,7 @@ export default function App(){
    setEntities(es);setCells(uniq((d.features||[]).map((f:any)=>f.properties?.h3_index).filter(Boolean)));const b=bounds(d.features||[]);if(b)mapRef.current?.fitBounds(b as any,{padding:{top:90,bottom:90,left:360,right:60},maxZoom:15,duration:700});notify('แสดงข้อมูลทั้งหมดของ '+name)
   }catch(e){notify(e instanceof Error?e.message:'Load failed')}
  },[datasets]);
- const display=useMemo(()=>uniq(cells.flatMap(c=>{try{const r=h3.getResolution(c);return resolution===r?[c]:resolution<r?[h3.cellToParent(c,resolution)]:h3.cellToChildren(c,resolution)}catch{return[]}})),[cells,resolution]);
+ const display=useMemo(()=>{const out=uniq(cells.flatMap(c=>{try{const r=h3.getResolution(c);return resolution===r?[c]:resolution<r?[h3.cellToParent(c,resolution)]:resolution-r>4?[]:h3.cellToChildren(c,resolution)}catch{return[]}}));return out.slice(0,250000)},[cells,resolution]);
  const layers=useMemo(()=>[
   new H3HexagonLayer({id:'h3-gpu',data:display.map(hex=>({hex})),pickable:true,highPrecision:'auto',filled:true,wireframe:true,
    getHexagon:(d:any)=>d.hex,getFillColor:()=>[...rgb(colors.fill),Math.round(colors.opacity*255)] as any,getLineColor:()=>[...rgb(colors.line),255] as any,lineWidthMinPixels:1,visible:h3Visible,
@@ -47,7 +47,7 @@ export default function App(){
  const runQuery=async()=>{if(!dataset)return notify('เลือก Dataset ก่อน');const field=(document.getElementById('qField') as HTMLSelectElement).value,op=(document.getElementById('qOp') as HTMLSelectElement).value,value=(document.getElementById('qValue') as HTMLInputElement).value;
   const spatialType=(document.getElementById('qSpatial') as HTMLSelectElement).value,spatial:any={type:spatialType};if(spatialType==='nearby'){const c=mapRef.current?.getCenter();spatial.lat=c?.lat;spatial.lng=c?.lng;spatial.radius_m=Number((document.getElementById('qDistance') as HTMLInputElement).value||1000)}
   if(spatialType==='bbox'){const b=mapRef.current?.getBounds();spatial.min_lat=b?.getSouth();spatial.max_lat=b?.getNorth();spatial.min_lng=b?.getWest();spatial.max_lng=b?.getEast()}
-  try{const r=await fetch(API+'/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:dataset.dataset,conditions:value?[{field,operator:op,value}]:[],spatial,limit:5000})});const d=await r.json();if(!r.ok)throw Error(d.detail||'Query failed');setResults(d.features||[]);setResultOpen(true);notify('Query สำเร็จ '+(d.features||[]).length.toLocaleString())}catch(e){notify(e instanceof Error?e.message:'Query failed')}};
+  try{const r=await fetch(API+'/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:dataset.dataset,conditions:value?[{field,operator:op,value:field==='attribute'?JSON.parse(value):value}]:[],spatial,limit:5000})});const d=await r.json();if(!r.ok)throw Error(d.detail||'Query failed');setResults(d.features||[]);setResultOpen(true);notify('Query สำเร็จ '+(d.features||[]).length.toLocaleString())}catch(e){notify(e instanceof Error?e.message:'Query failed')}};
  const execute=async()=>{if(!ingData||!ingName)return notify('ใส่ Dataset Name และ source ก่อน');const r=await fetch(API+'/ingestion/geojson/execute?resolution='+ingRes+'&dataset='+encodeURIComponent(ingName),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ingData)});const d=await r.json();if(!r.ok)return notify(d.detail||'Execute failed');notify('Ingestion completed: '+d.dataset);await refresh();setPage('map')};
  const file=async(f:File)=>{try{setIngData(JSON.parse(await f.text()));notify('โหลด GeoJSON แล้ว')}catch{notify('GeoJSON ไม่ถูกต้อง')}};
  const ready=useCallback((d:MapboxDraw)=>{drawRef.current=d},[]);
