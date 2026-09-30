@@ -2,92 +2,85 @@
 
 ## Design goal
 
-The database is a lightweight entity registry plus specialized tables.
+The database is a lightweight entity registry with Boundary H3 as the canonical polygon representation.
 
-- Original geometry is not stored.
-- `entities` stores only identity and dataset ownership.
-- Point coordinates are stored only for point entities.
-- H3 is the primary spatial index.
-- Dynamic attributes are stored as JSONB.
-- Raster files stay outside PostgreSQL; PostgreSQL stores metadata and URI.
-- Dataset controls the H3 resolution.
+- Original Polygon/MultiPolygon geometry is not stored.
+- Polygon storage keeps only boundary H3 cells.
+- Polygon holes are stored as separate H3 rings.
+- MultiPolygon parts stay grouped under one entity when they come from one GeoJSON Feature.
+- Polygon attributes are stored per part as JSONB.
+- Line uses H3 coverage along the line.
+- Point keeps exact latitude/longitude plus H3.
+- Dataset controls one canonical H3 resolution.
 
 ## Tables
 
 ### datasets
 
-Dataset definition and configuration.
+Dataset definition and H3 configuration.
 
-```
-dataset_id
-name
-data_type
-h3_resolution
-metadata
-created_at
-updated_at
-```
+Fields: dataset_id, name, data_type, h3_resolution, metadata, timestamps.
 
 ### entities
 
 Minimal entity registry.
 
-```
-entity_id
-dataset_id
-```
+Fields: entity_id, dataset_id.
+
+### entity_parts
+
+One spatial part of an entity. MultiPolygon uses multiple polygon parts.
+
+Fields: part_id, entity_id, part_index, part_type, bbox, properties JSONB, metadata.
+
+### entity_part_h3
+
+Canonical H3 storage.
+
+Fields: part_id, resolution, ring_id, ring_type, h3_index.
+
+Polygon ring_type: outer or hole. Line: line. Point: none.
 
 ### entity_point
 
-Optional point coordinates.
-
-```
-entity_id
-latitude
-longitude
-```
-
-### entity_h3
-
-Spatial index for all supported spatial entities.
-
-```
-entity_id
-resolution
-h3_index
-```
-
-### entity_attributes
-
-Flexible dataset-specific attributes.
-
-```
-entity_id
-properties JSONB
-```
+Exact point coordinates for point entities.
 
 ### raster_datasets
 
-Raster metadata only. Raster bytes are stored in object storage/filesystem.
+Raster metadata and external file URI only.
 
-### ingestion_runs / ingestion_h3_cells
+### ingestion_runs / ingestion_parts / ingestion_h3_cells
 
-Pipeline execution history and generated H3 output. These are separate from canonical entities.
+Pipeline history and generated boundary/line H3 output. These are separate from canonical entity storage.
+
+## Display model
+
+Database stores:
+
+Boundary H3 -> ring metadata -> part attributes
+
+API display reconstructs:
+
+Boundary H3 -> approximate ring -> H3 fill -> hole subtraction -> Map cells
+
+Therefore the database stays small while the Map still shows interior H3 cells.
 
 ## Query strategy
 
-BBox:
-H3 candidate lookup -> entity lookup -> point coordinate filter where applicable.
+Attribute: JSONB GIN index on entity_parts.properties.
 
-Nearby:
-H3 neighborhood -> entity_point -> exact distance calculation from latitude/longitude.
+BBox: part bbox candidates.
 
-Polygon intersection:
-H3 coverage overlap is used as the spatial candidate/intersection mechanism because original geometry is intentionally not retained.
+Polygon: boundary H3 candidates plus bbox candidates; exact original geometry intersection is intentionally unavailable.
 
-Attribute search:
-JSONB GIN index for flexible properties. Frequently queried attributes can later be promoted to typed/search-specific indexes.
+Nearby: exact point distance for entity_point.
+
+Line: H3 coverage lookup.
+
+## Compatibility
+
+entity_h3 is exposed as a view over entity_part_h3 so simple H3 lookup code can continue to work.
 
 ## Storage principle
 
-Do not duplicate Res5/Res8/Res11 columns in every entity. A dataset stores one selected resolution, and entity_h3 stores the generated H3 cells at that resolution.
+Do not store full polygon coverage as the canonical data. Store boundary H3 only and reconstruct display coverage when required.

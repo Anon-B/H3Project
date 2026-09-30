@@ -2,82 +2,58 @@
 
 ## datasets
 
-| Column | Type | Meaning |
-|---|---|---|
-| dataset_id | BIGSERIAL | dataset ID |
-| name | TEXT | unique dataset name |
-| data_type | TEXT | point, multipoint, polygon, multipolygon, geometry_collection, raster, or mixed |
-| h3_resolution | SMALLINT | H3 resolution selected by the dataset |
-| metadata | JSONB | dataset configuration/metadata |
-| created_at | TIMESTAMPTZ | creation time |
-| updated_at | TIMESTAMPTZ | last update time |
+| Column | Meaning |
+|---|---|
+| dataset_id | Dataset identifier |
+| name | Unique dataset name |
+| data_type | point, line, polygon, multipolygon, geometry_collection, raster, mixed |
+| h3_resolution | Canonical H3 resolution 5-15 |
+| metadata | Dataset configuration JSONB |
 
 ## entities
 
-| Column | Type | Meaning |
-|---|---|---|
-| entity_id | BIGINT | global entity ID |
-| dataset_id | BIGINT | owning dataset |
+| Column | Meaning |
+|---|---|
+| entity_id | Entity identifier |
+| dataset_id | Owning dataset |
 
-This table intentionally contains no geometry, coordinates, bbox, or dynamic properties.
+## entity_parts
+
+| Column | Meaning |
+|---|---|
+| part_id | Spatial part identifier |
+| entity_id | Parent entity |
+| part_index | Part order inside entity |
+| part_type | point, line, polygon |
+| min_lat/max_lat | Derived latitude bounding box |
+| min_lng/max_lng | Derived longitude bounding box |
+| properties | Attributes for this spatial part, JSONB |
+| metadata | Storage/reconstruction metadata |
+
+## entity_part_h3
+
+| Column | Meaning |
+|---|---|
+| part_id | Spatial part |
+| resolution | H3 resolution |
+| ring_id | Ring identifier; 0 is outer for Polygon |
+| ring_type | outer, hole, line, none |
+| h3_index | Stored H3 cell |
+
+For Polygon, only boundary H3 cells are stored. Interior H3 cells are reconstructed at display time.
 
 ## entity_point
 
-| Column | Type | Meaning |
-|---|---|---|
-| entity_id | BIGINT | entity reference |
-| latitude | DOUBLE PRECISION | WGS84 latitude |
-| longitude | DOUBLE PRECISION | WGS84 longitude |
+Exact latitude/longitude for Point entities.
 
-Only entities that have point coordinates need a row here.
+## ingestion_parts
 
-## entity_h3
-
-| Column | Type | Meaning |
-|---|---|---|
-| entity_id | BIGINT | entity reference |
-| resolution | SMALLINT | H3 resolution |
-| h3_index | TEXT | H3 cell identifier |
-
-Primary key: `entity_id, resolution, h3_index`.
-
-Lookup index: `resolution, h3_index, entity_id`.
-
-## entity_attributes
-
-| Column | Type | Meaning |
-|---|---|---|
-| entity_id | BIGINT | entity reference |
-| properties | JSONB | flexible dataset-specific attributes |
-
-A GIN index supports general JSONB searches.
-
-## raster_datasets
-
-| Column | Type | Meaning |
-|---|---|---|
-| raster_id | BIGSERIAL | raster record ID |
-| dataset_id | BIGINT | owning dataset |
-| file_uri | TEXT | external raster location |
-| min_lat/max_lat | DOUBLE PRECISION | latitude extent |
-| min_lng/max_lng | DOUBLE PRECISION | longitude extent |
-| format | TEXT | raster format |
-| size_bytes | BIGINT | file size |
-| metadata | JSONB | raster metadata |
-
-## ingestion_runs
-
-Tracks each ingestion execution.
+Records the source feature part created during a pipeline run.
 
 ## ingestion_h3_cells
 
-Stores generated H3 cells for ingestion runs before/independent of canonical entity loading.
+Pipeline output H3 records, including ring metadata. Polygon rows represent stored boundary H3; Line rows represent line coverage H3.
 
-## Governance
+## entity_h3 compatibility view
 
-- Coordinate system: EPSG:4326 / WGS84.
-- Original geometry is intentionally not retained.
-- Dataset chooses its H3 resolution.
-- Do not duplicate H3 resolutions as fixed columns on entities.
-- Keep frequently queried attributes indexed; avoid unnecessary per-attribute indexes.
-- Raster binary data belongs in object storage/filesystem, not the entity tables.
+The entity_h3 view exposes entity_id, resolution and h3_index from entity_part_h3 for simple legacy H3 lookups.
