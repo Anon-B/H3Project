@@ -1,6 +1,7 @@
 #!/bin/zsh
 set -euo pipefail
-cd /Users/anonpond/H3Project
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$PROJECT_DIR"
 colima start --cpu 10 --memory 20 --disk 80 || true
 docker context use colima
 docker-compose up -d --build

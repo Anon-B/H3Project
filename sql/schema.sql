@@ -1,19 +1,5 @@
 CREATE EXTENSION IF NOT EXISTS postgis;
 
-DROP TABLE IF EXISTS spatial_entities CASCADE;
-DROP TABLE IF EXISTS ingestion_h3_cells CASCADE;
-DROP TABLE IF EXISTS ingestion_parts CASCADE;
-DROP TABLE IF EXISTS ingestion_runs CASCADE;
-DROP TABLE IF EXISTS raster_datasets CASCADE;
-DROP TABLE IF EXISTS entity_part_h3 CASCADE;
-DROP TABLE IF EXISTS entity_parts CASCADE;
-DROP TABLE IF EXISTS entity_attributes CASCADE;
-DROP TABLE IF EXISTS entity_h3 CASCADE;
-DROP TABLE IF EXISTS entity_point CASCADE;
-DROP TABLE IF EXISTS entities CASCADE;
-DROP TABLE IF EXISTS datasets CASCADE;
-DROP TABLE IF EXISTS h3_summary_res8 CASCADE;
-DROP TABLE IF EXISTS h3_summary CASCADE;
 
 CREATE TABLE datasets (
   dataset_id BIGSERIAL PRIMARY KEY,
@@ -36,7 +22,7 @@ CREATE TABLE datasets (
 );
 
 CREATE TABLE entities (
-  entity_id BIGINT PRIMARY KEY,
+  entity_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   dataset_id BIGINT NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE
 );
 CREATE INDEX idx_entities_dataset ON entities(dataset_id, entity_id);
@@ -50,6 +36,7 @@ CREATE TABLE entity_parts (
   min_lng DOUBLE PRECISION,
   max_lat DOUBLE PRECISION,
   max_lng DOUBLE PRECISION,
+  geom geometry(Geometry,4326),
   properties JSONB NOT NULL DEFAULT '{}'::jsonb,
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
   UNIQUE(entity_id, part_index),
@@ -60,6 +47,7 @@ CREATE TABLE entity_parts (
 );
 CREATE INDEX idx_entity_parts_entity ON entity_parts(entity_id, part_index);
 CREATE INDEX idx_entity_parts_bbox ON entity_parts(min_lat, max_lat, min_lng, max_lng);
+CREATE INDEX idx_entity_parts_geom ON entity_parts USING GIST(geom);
 CREATE INDEX idx_entity_parts_properties ON entity_parts USING GIN(properties);
 
 CREATE TABLE entity_point (
@@ -117,7 +105,8 @@ CREATE TABLE ingestion_runs (
   output_cell_count BIGINT NOT NULL,
   status TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  finished_at TIMESTAMPTZ
 );
 CREATE INDEX idx_ingestion_runs_dataset ON ingestion_runs(dataset_id, id DESC);
 

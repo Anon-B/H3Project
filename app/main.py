@@ -1,4 +1,4 @@
-import os,time,json
+import os,time,json,hmac
 import h3,orjson,redis
 from pyproj import Geod
 from shapely.geometry import shape,Polygon,MultiPolygon,mapping
@@ -11,7 +11,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 DB=os.getenv("DATABASE_URL","postgresql://h3:h3@db:5432/h3project")
 REDIS=os.getenv("REDIS_URL","redis://redis:6379/0")
-API_KEY=os.getenv("API_KEY","")
+API_KEY=os.getenv("API_KEY","").strip()
+CORS_ORIGINS=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:8080,http://127.0.0.1:8080").split(",") if x.strip()]
 GEOD=Geod(ellps="WGS84")
 app=FastAPI(title="H3Project API",version="1.1.0",default_response_class=ORJSONResponse)
 rdb=redis.Redis.from_url(REDIS,decode_responses=True)
@@ -19,17 +20,38 @@ pool=ConnectionPool(DB,min_size=2,max_size=20,open=True)
 
 @app.middleware("http")
 async def auth(request:Request,call_next):
-    if API_KEY and request.url.path not in {"/health","/ready"} and request.headers.get("x-api-key")!=API_KEY:
+    if API_KEY and request.url.path not in {"/health","/ready"} and not hmac.compare_digest(request.headers.get("x-api-key", ""),API_KEY):
         return ORJSONResponse({"detail":"invalid api key"},status_code=401)
     return await call_next(request)
 
-app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
+app.add_middleware(CORSMiddleware,allow_origins=CORS_ORIGINS,allow_methods=["GET","POST","PATCH","DELETE","OPTIONS"],allow_headers=["Content-Type","Authorization","X-API-Key"])
 app.add_middleware(GZipMiddleware,minimum_size=1000)
 
 def db_conn(): return pool.connection()
 def redis_ok():
     try:return bool(rdb.ping())
     except Exception:return False
+
+def invalidate_cache():
+    try:
+        for key in rdb.scan_iter(match="h3:*"): rdb.delete(key)
+    except Exception: pass
+
+def _coord_xy(value):
+    if not isinstance(value,(list,tuple)) or len(value)<2: raise ValueError("coordinate must contain [longitude, latitude]")
+    lng,lat=float(value[0]),float(value[1])
+    if not -180<=lng<=180 or not -90<=lat<=90: raise ValueError("invalid coordinate")
+    return lng,lat
+
+def _validate_geometry_coordinates(geometry):
+    coords=geometry.get("coordinates")
+    def walk(value):
+        if isinstance(value,(list,tuple)) and value and isinstance(value[0],(int,float)):
+            _coord_xy(value); return
+        if isinstance(value,(list,tuple)):
+            for item in value: walk(item)
+    if coords is not None: walk(coords)
+    for child in geometry.get("geometries",[]) or []: _validate_geometry_coordinates(child)
 
 def _normalize_geojson(payload):
     t=payload.get("type")
@@ -64,15 +86,18 @@ def _line_cells(coords,res):
     return cells
 
 def _geometry_parts(geometry,res):
+    _validate_geometry_coordinates(geometry)
+    if geometry.get("type") in {"Polygon","MultiPolygon"} and not shape(geometry).is_valid:
+        raise ValueError("invalid polygon geometry")
     t=geometry.get("type")
     if t=="Point":
-        lng,lat=geometry["coordinates"]
+        lng,lat=_coord_xy(geometry["coordinates"])
         return [{"part_index":0,"part_type":"point","rings":[(0,"none",[geometry["coordinates"]])],
                  "cells":[(0,"none",h3.latlng_to_cell(float(lat),float(lng),res))]}]
     if t=="MultiPoint":
         parts=[]
         for i,p in enumerate(geometry.get("coordinates",[])):
-            lng,lat=p
+            lng,lat=_coord_xy(p)
             parts.append({"part_index":i,"part_type":"point","rings":[(0,"none",[p])],
                           "cells":[(0,"none",h3.latlng_to_cell(float(lat),float(lng),res))]})
         return parts
@@ -124,6 +149,18 @@ def _geodesic_area(geom):
     if gt=="MultiPolygon":return sum(_geodesic_area(g) for g in geom.geoms)
     if hasattr(geom,"geoms"):return sum(_geodesic_area(g) for g in geom.geoms)
     return 0.0
+
+def _estimate_polygon_cells(geometry,res):
+    t=geometry.get("type")
+    geoms=[geometry] if t=="Polygon" else [{"type":"Polygon","coordinates":p} for p in geometry.get("coordinates",[])] if t=="MultiPolygon" else []
+    if not geoms:return 0
+    area=sum(_geodesic_area(shape(g)) for g in geoms)
+    avg=max(float(h3.average_hexagon_area(res,unit="m^2")),1.0)
+    return int(area/avg*1.5)+1
+
+def _guard_h3_workload(geometry,res,max_cells=500000):
+    estimate=_estimate_polygon_cells(geometry,res)
+    if estimate>max_cells: raise ValueError("estimated H3 workload exceeds safe limit")
 
 def _analytics_for_part(part,res):
     out=[];ptype=part["part_type"]
@@ -219,6 +256,8 @@ def _preview(payload,res):
         row={"feature_index":i,"feature_id":str(f.get("id",i)),
              "geometry_type":geom.get("type"),"properties":f.get("properties") or {},"parts":[]}
         try:
+            if geom.get("type") in {"Polygon","MultiPolygon"}:
+                _guard_h3_workload(geom,res)
             parts=_geometry_parts(geom,res)
             for part in parts:
                 b=[{"ring_id":r,"ring_type":rt,"h3_index":c} for r,rt,c in part["cells"]]
@@ -328,11 +367,8 @@ def delete_dataset(dataset_id:int):
             cur.execute("DELETE FROM datasets WHERE dataset_id=%s RETURNING dataset_id,name",(dataset_id,));x=cur.fetchone()
             if not x:raise HTTPException(404,"dataset not found")
             c.commit()
-    if redis_ok():rdb.flushdb()
+    invalidate_cache()
     return {"deleted":True,"dataset_id":x[0],"dataset":x[1]}
-
-def _next_entity_id(cur):
-    cur.execute("SELECT COALESCE(max(entity_id),0)+1 FROM entities");return int(cur.fetchone()[0])
 
 def _insert_feature(cur,entity_id,dataset_id,feature,res,run_id=None):
     geom=feature.get("geometry") or {}
@@ -340,11 +376,14 @@ def _insert_feature(cur,entity_id,dataset_id,feature,res,run_id=None):
     parts=_geometry_parts(geom,res)
     for part in parts:
         bb=_part_bbox(part)
+        if part["part_type"]=="point": geom_payload={"type":"Point","coordinates":part["rings"][0][2][0]}
+        elif part["part_type"]=="line": geom_payload={"type":"LineString","coordinates":part["rings"][0][2]}
+        else: geom_payload={"type":"Polygon","coordinates":[r for _,_,r in part["rings"]]}
         cur.execute("""INSERT INTO entity_parts(
-                       entity_id,part_index,part_type,min_lat,min_lng,max_lat,max_lng,properties,metadata)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING part_id""",
+                       entity_id,part_index,part_type,min_lat,min_lng,max_lat,max_lng,geom,properties,metadata)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,ST_SetSRID(ST_GeomFromGeoJSON(%s),4326),%s,%s) RETURNING part_id""",
                     (entity_id,part["part_index"],part["part_type"],
-                     *(bb or (None,None,None,None)),json.dumps({}),
+                     *(bb or (None,None,None,None)),json.dumps(geom_payload),json.dumps({}),
                      json.dumps({"boundary_only":part["part_type"]=="polygon",
                                  "source_geometry":geom.get("type"),"resolution":res})))
         part_id=cur.fetchone()[0]
@@ -384,7 +423,11 @@ def _execute_ingestion(payload,res,dataset_name=None):
     with db_conn() as c:
         with c.cursor() as cur:
             cur.execute("SELECT dataset_id FROM datasets WHERE name=%s",(name,));existing=cur.fetchone()
-            if existing:dataset_id=existing[0]
+            if existing:
+                dataset_id=existing[0]
+                cur.execute("SELECT h3_resolution,data_type FROM datasets WHERE dataset_id=%s",(dataset_id,))
+                current=cur.fetchone()
+                if current[0]!=res or current[1]!=dtype: raise HTTPException(409,"dataset exists with different resolution or data type")
             else:
                 cur.execute("""INSERT INTO datasets(
                            name,data_type,h3_resolution,metadata,source,source_format)
@@ -396,15 +439,16 @@ def _execute_ingestion(payload,res,dataset_name=None):
                          json.dumps({"resolution":res,"storage_mode":"boundary_h3",
                          "display_reconstruction":"h3_boundary_fill"})));run_id=cur.fetchone()[0]
             for i,f in enumerate(features):
-                f=dict(f);f["_index"]=i;eid=_next_entity_id(cur)
-                cur.execute("INSERT INTO entities(entity_id,dataset_id) VALUES (%s,%s)",(eid,dataset_id))
+                f=dict(f);f["_index"]=i
+                cur.execute("INSERT INTO entities(dataset_id,ingestion_run_id) VALUES (%s,%s) RETURNING entity_id",(dataset_id,run_id))
+                eid=cur.fetchone()[0]
                 cur.execute("""INSERT INTO entity_attributes(entity_id,properties)
                                VALUES (%s,%s)
                                ON CONFLICT(entity_id) DO UPDATE SET properties=EXCLUDED.properties""",
                             (eid,json.dumps(f.get("properties") or {})))
                 _insert_feature(cur,eid,dataset_id,f,res,run_id)
-            cur.execute("UPDATE ingestion_runs SET status='completed' WHERE id=%s",(run_id,));c.commit()
-    if redis_ok():rdb.flushdb()
+            cur.execute("UPDATE ingestion_runs SET status='completed',finished_at=now() WHERE id=%s",(run_id,));c.commit()
+    invalidate_cache()
     return {"run_id":run_id,"status":"completed","dataset":name,"resolution":res,
             "feature_count":preview["feature_count"],"stored_boundary_cells":preview["boundary_cells"],
             "display_cells":preview["display_cells"],"storage_mode":"boundary_h3"}
@@ -584,14 +628,19 @@ def advanced_query(body:dict=Body(...)):
     elif stype=="polygon":
         geom=spatial.get("geojson")
         if not geom:raise HTTPException(400,"polygon geojson required")
-        qcells=_overlap_cells(geom,int(spatial.get("resolution",11)))
-        if qcells:
-            where.append("(h.h3_index = ANY(%s) OR (p.min_lat <= %s AND p.max_lat >= %s AND p.min_lng <= %s AND p.max_lng >= %s))")
-            params += [list(qcells),float(spatial.get("max_lat",90)),float(spatial.get("min_lat",-90)),
-                       float(spatial.get("max_lng",180)),float(spatial.get("min_lng",-180))]
+        _validate_geometry_coordinates(geom)
+        where.append("ST_Intersects(p.geom,ST_SetSRID(ST_GeomFromGeoJSON(%s),4326))")
+        params.append(json.dumps(geom))
+    elif stype=="nearby":
+        lat=float(spatial.get("lat"));lng=float(spatial.get("lng"));radius=float(spatial.get("radius_m",1000))
+        if not -90<=lat<=90 or not -180<=lng<=180 or not 0<radius<=50000:raise HTTPException(400,"invalid nearby parameters")
+        where.append("ST_DWithin(p.geom::geography,ST_SetSRID(ST_MakePoint(%s,%s),4326)::geography,%s)")
+        params += [lng,lat,radius]
+    elif stype not in {"none","bbox"}:
+        raise HTTPException(400,"unsupported spatial type: "+stype)
     if not where:where.append("TRUE")
     sql="""SELECT DISTINCT e.entity_id,d.name,d.data_type,d.h3_resolution,p.part_id,p.part_index,p.part_type,
-                  p.min_lat,p.min_lng,p.max_lat,p.max_lng,a.properties
+                  p.min_lat,p.min_lng,p.max_lat,p.max_lng,a.properties,ST_AsGeoJSON(p.geom)
            FROM entities e JOIN datasets d ON d.dataset_id=e.dataset_id
            JOIN entity_parts p ON p.entity_id=e.entity_id
            LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id
@@ -604,7 +653,7 @@ def advanced_query(body:dict=Body(...)):
     for x in rows:
         props={"entity_id":x[0],"dataset":x[1],"data_type":x[2],"h3_resolution":x[3],
                "part_index":x[5],"part_type":x[6],"properties":x[11] or {}}
-        features.append({"type":"Feature","geometry":None,"properties":props})
+        features.append({"type":"Feature","geometry":json.loads(x[12]) if x[12] else None,"properties":props})
     return {"type":"FeatureCollection","features":features,
             "meta":{"count":len(features),"limit":limit,"spatial_type":stype,"storage_mode":"boundary_h3"}}
 

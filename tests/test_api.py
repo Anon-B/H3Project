@@ -34,7 +34,30 @@ def test_h3_analytics():
         assert row["entity_count"]>=1
 
 def test_dataset_catalog():
-    r=httpx.get(BASE+"/datasets/4",timeout=10)
+    catalog=httpx.get(BASE+"/ingestion/datasets",timeout=10)
+    assert catalog.status_code==200
+    item=next(x for x in catalog.json()["datasets"] if x["dataset"]=="api-test")
+    r=httpx.get(BASE+"/datasets/"+str(item["dataset_id"]),timeout=10)
     assert r.status_code==200
     body=r.json()
     assert "source" in body and "version" in body and "schema" in body
+
+def test_query_nearby_returns_geometry():
+    r=httpx.post(BASE+"/query",json={"dataset":"api-test","conditions":[],"spatial":{"type":"nearby","lat":13.7563,"lng":100.5018,"radius_m":5000},"limit":10},timeout=10)
+    assert r.status_code==200
+    body=r.json()
+    assert body["meta"]["spatial_type"]=="nearby"
+    assert all(x["geometry"] for x in body["features"])
+
+def test_query_rejects_unknown_spatial_type():
+    r=httpx.post(BASE+"/query",json={"dataset":"api-test","conditions":[],"spatial":{"type":"unknown"},"limit":10},timeout=10)
+    assert r.status_code==400
+
+def test_geojson_preview_accepts_altitude_and_rejects_invalid_coordinate():
+    payload={"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[100.5,13.75,15]},"properties":{}}]}
+    r=httpx.post(BASE+"/ingestion/geojson/preview?resolution=11",json=payload,timeout=10)
+    assert r.status_code==200
+    assert "error" not in r.json()["features"][0]
+    bad={"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[100.5,1300]},"properties":{}}]}
+    r=httpx.post(BASE+"/ingestion/geojson/execute?resolution=11&dataset=invalid-coordinate-test",json=bad,timeout=10)
+    assert r.status_code==400
