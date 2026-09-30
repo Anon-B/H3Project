@@ -1,8 +1,8 @@
 import {useCallback,useEffect,useMemo,useRef,useState} from 'react';
-import DeckGL from '@deck.gl/react';
+import {MapLibreOverlay} from '@deck.gl/maplibre';
 import {H3HexagonLayer} from '@deck.gl/geo-layers';
 import {GeoJsonLayer,ScatterplotLayer} from '@deck.gl/layers';
-import {Map,useMap,NavigationControl,GeolocateControl,FullscreenControl,ScaleControl} from 'react-map-gl/maplibre';
+import {Map,useMap,useControl,NavigationControl,GeolocateControl,FullscreenControl,ScaleControl} from 'react-map-gl/maplibre';
 import type {MapRef} from 'react-map-gl/maplibre';
 import MapboxDraw from '@mapbox/mapbox-gl-draw';
 import type {FeatureCollection} from 'geojson';
@@ -17,12 +17,14 @@ type Entity={entity_id:any;latitude:number;longitude:number;[key:string]:any};
 function rgb(hex:string){const n=parseInt(hex.replace('#',''),16);return[(n>>16)&255,(n>>8)&255,n&255]}
 function uniq<T>(a:T[]){return[...new Set(a)]}
 function bounds(fs:any[]){let a=[Infinity,Infinity],b=[-Infinity,-Infinity];const w=(x:any)=>Array.isArray(x)&&typeof x[0]==='number'?(a=[Math.min(a[0],x[0]),Math.min(a[1],x[1])],b=[Math.max(b[0],x[0]),Math.max(b[1],x[1])]):Array.isArray(x)&&x.forEach(w);fs.forEach(f=>w(f.geometry?.coordinates));return a[0]===Infinity?null:[a,b]}
+function DeckGLOverlay({layers}:{layers:any[]}){const overlay=useControl<MapLibreOverlay>(()=>new MapLibreOverlay({interleaved:false,layers}));overlay.setProps({layers});return null}
 function DrawBridge({ready}:{ready:(d:MapboxDraw)=>void}){const {current}=useMap();useEffect(()=>{if(!current)return;const d=new MapboxDraw({displayControlsDefault:true});current.addControl(d as any,'top-right');ready(d);return()=>{try{current.removeControl(d as any)}catch{}}},[current,ready]);return null}
 export default function App(){
  const mapRef=useRef<MapRef>(null),drawRef=useRef<MapboxDraw|null>(null);
  const [page,setPage]=useState('map'),[datasets,setDatasets]=useState<Dataset[]>([]),[dataset,setDataset]=useState<Dataset|null>(null);
  const [entities,setEntities]=useState<Entity[]>([]),[cells,setCells]=useState<string[]>([]),[resolution,setResolution]=useState(11);
  const [h3Visible,setH3Visible]=useState(true),[entityVisible,setEntityVisible]=useState(true),[resultOpen,setResultOpen]=useState(false),[results,setResults]=useState<any[]>([]);
+ const [height3d,setHeight3d]=useState(Number(localStorage.getItem('h3-height-3d')||120)),[extruded3d,setExtruded3d]=useState(localStorage.getItem('h3-extruded-3d')==='true');
  const [dark,setDark]=useState(localStorage.getItem('h3-theme')==='dark'),[basemap,setBasemap]=useState(localStorage.getItem('h3-basemap')||'liberty');
  const [stats,setStats]=useState(false),[toast,setToast]=useState('');
  const [colors,setColors]=useState(()=>({entity:localStorage.getItem('h3-entity-color')||'#2563eb',fill:localStorage.getItem('h3-h3-color')||'#2563eb',line:localStorage.getItem('h3-h3-line-color')||'#1d4ed8',opacity:Number(localStorage.getItem('h3-h3-opacity')||13)/100}));
@@ -41,13 +43,13 @@ export default function App(){
  },[datasets]);
  const display=useMemo(()=>{const out=uniq(cells.flatMap(c=>{try{const r=h3.getResolution(c);return resolution===r?[c]:resolution<r?[h3.cellToParent(c,resolution)]:resolution-r>4?[]:h3.cellToChildren(c,resolution)}catch{return[]}}));return out.slice(0,250000)},[cells,resolution]);
  const layers=useMemo(()=>[
-  new H3HexagonLayer({id:'h3-gpu',data:display.map(hex=>({hex})),pickable:true,highPrecision:'auto',filled:true,wireframe:true,
-   getHexagon:(d:any)=>d.hex,getFillColor:()=>[...rgb(colors.fill),Math.round(colors.opacity*255)] as any,getLineColor:()=>[...rgb(colors.line),255] as any,lineWidthMinPixels:1,visible:h3Visible,
+  new H3HexagonLayer({id:'h3-gpu',data:display.map(hex=>({hex})),pickable:true,highPrecision:'auto',filled:true,wireframe:extruded3d,extruded:extruded3d,elevationScale:1,
+   getHexagon:(d:any)=>d.hex,getElevation:()=>height3d,getFillColor:()=>[...rgb(colors.fill),Math.round(colors.opacity*255)] as any,getLineColor:()=>[...rgb(colors.line),255] as any,lineWidthMinPixels:1,visible:h3Visible,
    onClick:(i:any)=>i.object&&(setResults([i.object]),setResultOpen(true))}),
   new ScatterplotLayer({id:'entity-gpu',data:entities,pickable:true,getPosition:(d:any)=>[d.longitude,d.latitude],getRadius:45,radiusMinPixels:4,radiusMaxPixels:9,getFillColor:()=>[...rgb(colors.entity),230] as any,visible:entityVisible,
    onClick:(i:any)=>i.object&&(setResults([i.object]),setResultOpen(true))}),
   new GeoJsonLayer({id:'query-result',data:results.length?{type:'FeatureCollection',features:results.filter(x=>x.geometry)}:undefined,filled:true,stroked:true,getFillColor:[37,99,235,45],getLineColor:[37,99,235,220],getLineWidth:2})
- ],[display,entities,colors,h3Visible,entityVisible,results]);
+ ],[display,entities,colors,h3Visible,entityVisible,results,extruded3d,height3d]);
  const runQuery=async()=>{if(!dataset)return notify('เลือก Dataset ก่อน');const field=(document.getElementById('qField') as HTMLSelectElement).value,op=(document.getElementById('qOp') as HTMLSelectElement).value,value=(document.getElementById('qValue') as HTMLInputElement).value;
   const spatialType=(document.getElementById('qSpatial') as HTMLSelectElement).value,spatial:any={type:spatialType};if(spatialType==='nearby'){const c=mapRef.current?.getCenter();spatial.lat=c?.lat;spatial.lng=c?.lng;spatial.radius_m=Number((document.getElementById('qDistance') as HTMLInputElement).value||1000)}
   if(spatialType==='bbox'){const b=mapRef.current?.getBounds();spatial.min_lat=b?.getSouth();spatial.max_lat=b?.getNorth();spatial.min_lng=b?.getWest();spatial.max_lng=b?.getEast()}
@@ -62,8 +64,8 @@ export default function App(){
  <Nav id="dashboard" p={page} set={setPage} t="▦ Dashboard"/><Nav id="datasets" p={page} set={setPage} t="▤ Datasets"/><Nav id="ingestion" p={page} set={setPage} t="↥ Ingestion"/><Nav id="map" p={page} set={setPage} t="⌖ Map"/><Nav id="analysis" p={page} set={setPage} t="⌁ Analysis"/><Nav id="settings" p={page} set={setPage} t="⚙ Settings"/>
  <div className="sideFoot">React + TypeScript<br/>MapLibre + deck.gl H3</div></aside>
  <main className="workspace"><header className="topbar"><b>{page}</b><input placeholder="Search dataset, entity, H3 index..."/><button onClick={()=>setStats(!stats)}>▥</button><button onClick={()=>setDark(!dark)}>{dark?'☾':'☀'}</button></header>
- {page==='map'&&<section className="mapPage"><DeckGL initialViewState={{longitude:100.5018,latitude:13.7563,zoom:10}} controller={{dragRotate:true,touchRotate:true}} layers={layers} getTooltip={(x:any)=>x.object?String(x.object.hex||x.object.entity_id||''):null}><Map ref={mapRef} mapStyle={style}><NavigationControl position="top-right" showZoom showCompass visualizePitch/><GeolocateControl position="top-right" positionOptions={{enableHighAccuracy:true,timeout:6000}} trackUserLocation={false} showUserLocation showAccuracyCircle/><FullscreenControl position="top-right"/><ScaleControl position="bottom-left" unit="metric" maxWidth={110}/></Map></DeckGL>
- <MapPanel {...{datasets,dataset,load,resolution,setResolution,h3Visible,setH3Visible,entityVisible,setEntityVisible,colors,setColors,dataStyle,applyDataStyle,updateDataColor,dataStyleOptions,basemap,setBasemap,runQuery}}/>
+ {page==='map'&&<section className="mapPage"><Map ref={mapRef} mapStyle={style} dragRotate={true} touchZoomRotate={true} touchPitch={true}><NavigationControl position="top-right" showZoom showCompass visualizePitch/><GeolocateControl position="top-right" positionOptions={{enableHighAccuracy:true,timeout:6000}} trackUserLocation={false} showUserLocation showAccuracyCircle/><FullscreenControl position="top-right"/><ScaleControl position="bottom-left" unit="metric" maxWidth={110}/><DeckGLOverlay layers={layers}/></Map>
+ <MapPanel {...{datasets,dataset,load,resolution,setResolution,h3Visible,setH3Visible,entityVisible,setEntityVisible,colors,setColors,dataStyle,applyDataStyle,updateDataColor,dataStyleOptions,basemap,setBasemap,height3d,setHeight3d,extruded3d,setExtruded3d,runQuery}}/>
  {stats&&<div className="stats"><b>Dataset<br/>{dataset?.dataset||'—'}</b><b>Entities<br/>{dataset?.feature_count?.toLocaleString()||'—'}</b><b>H3<br/>GPU</b><b>Visible<br/>{display.length.toLocaleString()}</b></div>}
  {resultOpen&&<Results data={results} close={()=>setResultOpen(false)}/>}</section>}
  {page==='ingestion'&&<section className="page"><h2>Ingestion Pipeline</h2><p>GeoJSON หรือ Draw → Boundary H3</p><div className="grid2"><div className="card"><div className="buttonRow"><button className={ingMode==='file'?'primary':''} onClick={()=>setIngMode('file')}>📄 File / GeoJSON</button><button className={ingMode==='draw'?'primary':''} onClick={()=>setIngMode('draw')}>✏️ Draw</button></div><label>Dataset Name<input value={ingName} onChange={e=>setIngName(e.target.value)}/></label><label>H3 Resolution<select value={ingRes} onChange={e=>setIngRes(+e.target.value)}>{Array.from({length:11},(_,i)=><option key={i} value={i+5}>Res {i+5}</option>)}</select></label>
@@ -79,6 +81,7 @@ function Nav({id,p,set,t}:{id:string;p:string;set:(x:string)=>void;t:string}){re
 function MapPanel(p:any){return <aside className="panel left"><div className="section"><b>Dataset</b><select value={p.dataset?.dataset||''} onChange={e=>p.load(e.target.value)}><option value="">Select dataset</option>{p.datasets.map((d:any)=><option key={d.dataset}>{d.dataset}</option>)}</select><div className="card"><b>{p.dataset?.dataset||'No dataset'}</b><small>Res {p.dataset?.h3_resolution||'—'} · {p.dataset?.feature_count?.toLocaleString()||0} entities</small></div></div>
  <div className="section"><b>Layers</b><Check t="Entities" v={p.entityVisible} s={p.setEntityVisible}/><Check t="H3 GPU" v={p.h3Visible} s={p.setH3Visible}/></div>
  <div className="section"><b>Data Colors</b><label>Style<select value={p.dataStyle} onChange={e=>p.applyDataStyle(e.target.value)}><option value="custom">Custom</option>{p.dataStyleOptions.map(([k,v]:any)=><option key={k} value={k}>{v.name}</option>)}</select></label><label>Entity <input type="color" value={p.colors.entity} onChange={e=>p.updateDataColor('entity',e.target.value)}/></label><label>H3 Fill <input type="color" value={p.colors.fill} onChange={e=>p.updateDataColor('fill',e.target.value)}/></label><label>H3 Border <input type="color" value={p.colors.line} onChange={e=>p.updateDataColor('line',e.target.value)}/></label><label>Opacity <input type="range" min="0" max="1" step=".01" value={p.colors.opacity} onChange={e=>p.updateDataColor('opacity',+e.target.value)}/></label><button className="full" onClick={()=>p.applyDataStyle('default')}>Reset Default</button></div>
+ <div className="section"><b>3D Data Height</b><Check t="Extrude H3" v={p.extruded3d} s={(v:boolean)=>{p.setExtruded3d(v);localStorage.setItem('h3-extruded-3d',String(v))}}/><label>Height <b>{p.height3d.toLocaleString()} m</b><input type="range" min="0" max="2000" step="10" value={p.height3d} onChange={e=>{const v=+e.target.value;p.setHeight3d(v);localStorage.setItem('h3-height-3d',String(v))}}/></label></div>
  <div className="section"><b>H3 Display — Res {p.resolution}</b><input type="range" min="5" max="15" value={p.resolution} onChange={e=>p.setResolution(+e.target.value)}/><div className="resGrid">{Array.from({length:11},(_,i)=>i+5).map(r=><button className={r===p.resolution?'active':''} key={r} onClick={()=>p.setResolution(r)}>{r}</button>)}</div></div>
  <div className="section"><b>Advanced Query</b><select id="qField"><option>attribute</option><option>properties.category</option><option>properties.name</option><option>entity_id</option><option>h3_index</option><option>resolution</option></select><select id="qOp"><option>=</option><option>!=</option><option>contains</option></select><input id="qValue" placeholder="value"/><select id="qSpatial"><option value="none">None</option><option value="nearby">Nearby</option><option value="bbox">BBox</option></select><input id="qDistance" type="number" defaultValue="1000"/><button className="primary full" onClick={p.runQuery}>Run Query</button></div>
  <div className="section"><b>Basemap</b><select value={p.basemap} onChange={e=>p.setBasemap(e.target.value)}>{Object.entries(BASEMAPS).map(([k,v]:any)=><option key={k} value={k}>{v.name}</option>)}</select></div></aside>}
