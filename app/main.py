@@ -9,7 +9,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 DB=os.getenv("DATABASE_URL","postgresql://h3:h3@db:5432/h3project")
 REDIS=os.getenv("REDIS_URL","redis://redis:6379/0")
 API_KEY=os.getenv("API_KEY","")
-app=FastAPI(title="H3Project API",version="0.4.0",default_response_class=ORJSONResponse)
+app=FastAPI(title="H3Project API",version="0.5.0",default_response_class=ORJSONResponse)
 rdb=redis.Redis.from_url(REDIS,decode_responses=True)
 pool=ConnectionPool(DB,min_size=2,max_size=20,open=True)
 
@@ -101,14 +101,56 @@ def metrics():
 def ingestion_datasets(limit:int=Query(100,ge=1,le=500)):
     with db_conn() as c:
         with c.cursor() as cur:
-            cur.execute("SELECT d.name,d.data_type,d.h3_resolution,count(e.entity_id) FROM datasets d LEFT JOIN entities e ON e.dataset_id=d.dataset_id GROUP BY d.dataset_id ORDER BY d.name LIMIT %s",(limit,))
+            cur.execute("""SELECT d.dataset_id,d.name,d.data_type,d.h3_resolution,d.metadata,d.created_at,d.updated_at,count(e.entity_id)
+                           FROM datasets d LEFT JOIN entities e ON e.dataset_id=d.dataset_id
+                           GROUP BY d.dataset_id ORDER BY d.name LIMIT %s""",(limit,))
             rows=cur.fetchall()
-    return {"datasets":[{"dataset":x[0],"data_type":x[1],"h3_resolution":x[2],"feature_count":x[3]} for x in rows]}
+    return {"datasets":[{"dataset_id":x[0],"dataset":x[1],"data_type":x[2],"h3_resolution":x[3],"metadata":x[4] or {},"created_at":x[5],"updated_at":x[6],"feature_count":x[7]} for x in rows]}
+
+@app.get("/datasets/{dataset_id}")
+def dataset_detail(dataset_id:int):
+    with db_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("""SELECT d.dataset_id,d.name,d.data_type,d.h3_resolution,d.metadata,d.created_at,d.updated_at,
+                                  count(DISTINCT e.entity_id),count(DISTINCT h.h3_index)
+                           FROM datasets d LEFT JOIN entities e ON e.dataset_id=d.dataset_id
+                           LEFT JOIN entity_h3 h ON h.entity_id=e.entity_id
+                           WHERE d.dataset_id=%s GROUP BY d.dataset_id""",(dataset_id,))
+            x=cur.fetchone()
+            if not x:raise HTTPException(404,"dataset not found")
+    return {"dataset_id":x[0],"name":x[1],"data_type":x[2],"h3_resolution":x[3],"metadata":x[4] or {},"created_at":x[5],"updated_at":x[6],"entity_count":x[7],"h3_row_count":x[8]}
+
+@app.patch("/datasets/{dataset_id}")
+def update_dataset(dataset_id:int,body:dict=Body(...)):
+    allowed={"name","metadata","h3_resolution"}
+    changes={k:v for k,v in body.items() if k in allowed}
+    if not changes:raise HTTPException(400,"nothing to update")
+    if "h3_resolution" in changes and not 5<=int(changes["h3_resolution"])<=15:raise HTTPException(400,"resolution must be 5..15")
+    with db_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("SELECT 1 FROM datasets WHERE dataset_id=%s",(dataset_id,))
+            if not cur.fetchone():raise HTTPException(404,"dataset not found")
+            sets=[];vals=[]
+            if "name" in changes:sets.append("name=%s");vals.append(str(changes["name"]).strip())
+            if "metadata" in changes:sets.append("metadata=%s");vals.append(json.dumps(changes["metadata"] or {}))
+            if "h3_resolution" in changes:sets.append("h3_resolution=%s");vals.append(int(changes["h3_resolution"]))
+            vals.append(dataset_id)
+            cur.execute("UPDATE datasets SET "+",".join(sets)+",updated_at=now() WHERE dataset_id=%s RETURNING dataset_id,name,data_type,h3_resolution,metadata,updated_at",vals)
+            x=cur.fetchone();c.commit()
+    return {"dataset_id":x[0],"name":x[1],"data_type":x[2],"h3_resolution":x[3],"metadata":x[4] or {},"updated_at":x[5]}
+
+@app.delete("/datasets/{dataset_id}")
+def delete_dataset(dataset_id:int):
+    with db_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("DELETE FROM datasets WHERE dataset_id=%s RETURNING dataset_id,name",(dataset_id,));x=cur.fetchone()
+            if not x:raise HTTPException(404,"dataset not found")
+            c.commit()
+    if redis_ok():rdb.flushdb()
+    return {"deleted":True,"dataset_id":x[0],"dataset":x[1]}
 
 def _dataset_rows(name,limit=10000,res=None):
-    sql="""SELECT e.entity_id,d.name,d.data_type,d.h3_resolution,
-                  p.latitude,p.longitude,
-                  a.properties,
+    sql="""SELECT e.entity_id,d.name,d.data_type,d.h3_resolution,p.latitude,p.longitude,a.properties,
                   COALESCE(array_agg(h.h3_index) FILTER (WHERE h.h3_index IS NOT NULL),'{}')
            FROM entities e JOIN datasets d ON d.dataset_id=e.dataset_id
            LEFT JOIN entity_point p ON p.entity_id=e.entity_id
@@ -128,13 +170,74 @@ def ingestion_dataset_preview(body:dict=Body(...)):
     if not 5<=res<=15:raise HTTPException(400,"resolution must be 5..15")
     rows=_dataset_rows(name,min(limit,10000),res)
     if not rows:raise HTTPException(404,"dataset not found or empty")
-    features=[]
-    cells=set()
+    features=[];cells=set()
     for eid,ds,dt,default_res,lat,lng,props,hcells in rows:
-        for c in hcells:cells.add(c)
+        cells.update(hcells)
         if lat is not None and lng is not None:
             features.append({"type":"Feature","id":str(eid),"geometry":{"type":"Point","coordinates":[lng,lat]},"properties":{"entity_id":eid,"dataset":ds,"properties":props or {},f"h3_res{res}":hcells}})
     return {"source_type":"dataset","dataset":name,"resolution":res,"feature_count":len(rows),"unique_cells":{f"res{res}":len(cells)},"features":features}
+
+@app.post("/query")
+def advanced_query(body:dict=Body(...)):
+    dataset=str(body.get("dataset") or "").strip() or None
+    conditions=body.get("conditions") or []
+    spatial=body.get("spatial") or {}
+    limit=max(1,min(int(body.get("limit",5000)),20000))
+    where=[];params=[]
+    if dataset:where.append("d.name=%s");params.append(dataset)
+    for cond in conditions:
+        field=str(cond.get("field","")).strip();op=str(cond.get("operator","="));value=cond.get("value")
+        if field=="entity_id":
+            try:v=int(value)
+            except:raise HTTPException(400,"entity_id must be numeric")
+            if op not in {"=","!=","<",">","<=",">="}:raise HTTPException(400,"unsupported entity_id operator")
+            where.append("e.entity_id "+op+" %s");params.append(v)
+        elif field in {"h3_index","resolution"}:
+            if field=="resolution":
+                try:value=int(value)
+                except:raise HTTPException(400,"resolution must be numeric")
+            if op not in {"=","!=","<",">","<=",">="}:raise HTTPException(400,"unsupported H3 operator")
+            where.append("h.resolution "+op+" %s" if field=="resolution" else "h.h3_index "+op+" %s");params.append(value)
+        elif field.startswith("properties."):
+            key=field.split(".",1)[1]
+            if not key or op not in {"=","!=","contains"}:raise HTTPException(400,"unsupported attribute operator")
+            if op=="contains":where.append("a.properties->>%s ILIKE %s");params.extend([key,"%"+str(value)+"%"])
+            else:where.append("(a.properties->>%s) "+op+" %s");params.extend([key,str(value)])
+        elif field=="attribute":
+            if not isinstance(value,dict):raise HTTPException(400,"attribute filter value must be JSON object")
+            where.append("a.properties @> %s::jsonb");params.append(json.dumps(value))
+        elif field:raise HTTPException(400,"unsupported query field: "+field)
+    stype=str(spatial.get("type","none"))
+    if stype=="bbox":
+        min_lat=float(spatial["min_lat"]);max_lat=float(spatial["max_lat"]);min_lng=float(spatial["min_lng"]);max_lng=float(spatial["max_lng"])
+        where += ["p.latitude BETWEEN %s AND %s","p.longitude BETWEEN %s AND %s"];params += [min_lat,max_lat,min_lng,max_lng]
+    elif stype=="nearby":
+        lat=float(spatial["lat"]);lng=float(spatial["lng"]);radius=float(spatial.get("radius_m",1000))
+        where.append("ST_DWithin(ST_SetSRID(ST_MakePoint(p.longitude,p.latitude),4326)::geography,ST_SetSRID(ST_MakePoint(%s,%s),4326)::geography,%s)")
+        params += [lng,lat,radius]
+    elif stype=="polygon":
+        geom=spatial.get("geojson")
+        if not geom:raise HTTPException(400,"polygon geojson required")
+        cells=_geojson_cells(geom,int(spatial.get("resolution",11)))
+        if not cells:return {"type":"FeatureCollection","features":[],"meta":{"count":0}}
+        where.append("h.h3_index = ANY(%s)");params.append(cells)
+    if not where:where.append("TRUE")
+    sql="""SELECT DISTINCT e.entity_id,d.name,d.data_type,d.h3_resolution,p.latitude,p.longitude,a.properties,h.h3_index,h.resolution
+           FROM entities e JOIN datasets d ON d.dataset_id=e.dataset_id
+           LEFT JOIN entity_point p ON p.entity_id=e.entity_id
+           LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
+           LEFT JOIN entity_h3 h ON h.entity_id=e.entity_id
+           WHERE """+" AND ".join(where)+""" ORDER BY e.entity_id LIMIT %s"""
+    params.append(limit)
+    with db_conn() as c:
+        with c.cursor() as cur:cur.execute(sql,params);rows=cur.fetchall()
+    features=[]
+    for x in rows:
+        props={"entity_id":x[0],"dataset":x[1],"data_type":x[2],"h3_resolution":x[3],"properties":x[6] or {}}
+        if x[7]:props.update({"h3_index":x[7],"resolution":x[8]})
+        geom={"type":"Point","coordinates":[x[5],x[4]]} if x[4] is not None else None
+        features.append({"type":"Feature","id":str(x[0]),"geometry":geom,"properties":props})
+    return {"type":"FeatureCollection","features":features,"meta":{"count":len(features),"limit":limit,"spatial_type":stype}}
 
 @app.get("/summary")
 def summary(res:int=Query(5,ge=5,le=15),dataset:str|None=None):
@@ -159,25 +262,20 @@ def summary(res:int=Query(5,ge=5,le=15),dataset:str|None=None):
 
 @app.get("/nearby")
 def nearby(lat:float,lng:float,radius_m:float=Query(1000,gt=0,le=50000),limit:int=Query(500,gt=0,le=5000),dataset:str|None=None):
-    started=time.perf_counter();clauses=["ST_DWithin(ST_SetSRID(ST_MakePoint(p.longitude,p.latitude),4326)::geography,ST_SetSRID(ST_MakePoint(%s,%s),4326)::geography,%s)"];params=[lng,lat,radius_m]
+    clauses=["ST_DWithin(ST_SetSRID(ST_MakePoint(p.longitude,p.latitude),4326)::geography,ST_SetSRID(ST_MakePoint(%s,%s),4326)::geography,%s)"];params=[lng,lat,radius_m]
     if dataset:clauses.append("d.name=%s");params.append(dataset)
-    sql="""SELECT e.entity_id,d.name,p.latitude,p.longitude,a.properties
-           FROM entity_point p JOIN entities e ON e.entity_id=p.entity_id JOIN datasets d ON d.dataset_id=e.dataset_id
-           LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
-           WHERE """+" AND ".join(clauses)+""" ORDER BY ST_Distance(ST_SetSRID(ST_MakePoint(p.longitude,p.latitude),4326)::geography,ST_SetSRID(ST_MakePoint(%s,%s),4326)::geography) LIMIT %s"""
+    sql="""SELECT e.entity_id,d.name,p.latitude,p.longitude,a.properties FROM entity_point p JOIN entities e ON e.entity_id=p.entity_id JOIN datasets d ON d.dataset_id=e.dataset_id LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id WHERE """+" AND ".join(clauses)+""" ORDER BY ST_Distance(ST_SetSRID(ST_MakePoint(p.longitude,p.latitude),4326)::geography,ST_SetSRID(ST_MakePoint(%s,%s),4326)::geography) LIMIT %s"""
     params += [lng,lat,limit]
     with db_conn() as c:
         with c.cursor() as cur:cur.execute(sql,params);rows=cur.fetchall()
-    return {"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[x[3],x[2]]},"properties":{"entity_id":x[0],"dataset":x[1],"properties":x[4] or {}}} for x in rows],"meta":{"count":len(rows),"elapsed_ms":round((time.perf_counter()-started)*1000,2),"source":"entity_point"}}
+    return {"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[x[3],x[2]]},"properties":{"entity_id":x[0],"dataset":x[1],"properties":x[4] or {}}} for x in rows],"meta":{"count":len(rows),"source":"entity_point"}}
 
 @app.get("/bbox")
 def bbox(min_lat:float,min_lng:float,max_lat:float,max_lng:float,limit:int=Query(5000,gt=0,le=20000),dataset:str|None=None):
     clauses=["p.latitude BETWEEN %s AND %s","p.longitude BETWEEN %s AND %s"];params=[min_lat,max_lat,min_lng,max_lng]
     if dataset:clauses.append("d.name=%s");params.append(dataset)
     params.append(limit)
-    sql="""SELECT e.entity_id,d.name,p.latitude,p.longitude,a.properties
-           FROM entity_point p JOIN entities e ON e.entity_id=p.entity_id JOIN datasets d ON d.dataset_id=e.dataset_id
-           LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id WHERE """+" AND ".join(clauses)+""" LIMIT %s"""
+    sql="""SELECT e.entity_id,d.name,p.latitude,p.longitude,a.properties FROM entity_point p JOIN entities e ON e.entity_id=p.entity_id JOIN datasets d ON d.dataset_id=e.dataset_id LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id WHERE """+" AND ".join(clauses)+""" LIMIT %s"""
     with db_conn() as c:
         with c.cursor() as cur:cur.execute(sql,params);rows=cur.fetchall()
     return {"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[x[3],x[2]]},"properties":{"entity_id":x[0],"dataset":x[1],"properties":x[4] or {}}} for x in rows],"meta":{"count":len(rows),"source":"bbox"}}
@@ -194,8 +292,7 @@ def _next_entity_id(cur):
 def _execute_ingestion(payload,res,dataset_name=None):
     preview=_preview(payload,res)
     if any("error" in x for x in preview["features"]):raise HTTPException(400,"one or more features failed H3 conversion")
-    features=_normalize_geojson(payload)
-    name=(dataset_name or "").strip()
+    features=_normalize_geojson(payload);name=(dataset_name or "").strip()
     if not name:raise HTTPException(400,"dataset name is required")
     dtype=_data_type(features)
     with db_conn() as c:
@@ -206,8 +303,7 @@ def _execute_ingestion(payload,res,dataset_name=None):
                 cur.execute("INSERT INTO datasets(name,data_type,h3_resolution,metadata) VALUES (%s,%s,%s,%s) RETURNING dataset_id",(name,dtype,res,json.dumps({})));dataset_id=cur.fetchone()[0]
             cur.execute("INSERT INTO ingestion_runs(dataset_id,source_type,input_feature_count,output_cell_count,status,metadata) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",(dataset_id,"geojson",preview["feature_count"],sum(preview["cell_counts"].values()),"running",json.dumps({"resolution":res})));run_id=cur.fetchone()[0]
             for i,(f,pr) in enumerate(zip(features,preview["features"])):
-                eid=_next_entity_id(cur)
-                cur.execute("INSERT INTO entities(entity_id,dataset_id) VALUES (%s,%s)",(eid,dataset_id))
+                eid=_next_entity_id(cur);cur.execute("INSERT INTO entities(entity_id,dataset_id) VALUES (%s,%s)",(eid,dataset_id))
                 point=_point_from_geometry(f.get("geometry") or {})
                 if point:cur.execute("INSERT INTO entity_point(entity_id,latitude,longitude) VALUES (%s,%s,%s)",(eid,point[0],point[1]))
                 cur.execute("INSERT INTO entity_attributes(entity_id,properties) VALUES (%s,%s)",(eid,json.dumps(f.get("properties") or {})))
@@ -227,8 +323,7 @@ def ingestion_dataset_execute(body:dict=Body(...)):
     rows=_dataset_rows(name,min(limit,10000),res)
     if not rows:raise HTTPException(404,"dataset not found or empty")
     features=[{"type":"Feature","id":str(x[0]),"geometry":{"type":"Point","coordinates":[x[5],x[4]]} if x[4] is not None else None,"properties":x[6] or {}} for x in rows]
-    payload={"type":"FeatureCollection","features":[f for f in features if f["geometry"]]}
-    return _execute_ingestion(payload,res,name)
+    return _execute_ingestion({"type":"FeatureCollection","features":[f for f in features if f["geometry"]]},res,name)
 
 @app.get("/ingestion/runs")
 def ingestion_runs(limit:int=Query(20,ge=1,le=100)):
