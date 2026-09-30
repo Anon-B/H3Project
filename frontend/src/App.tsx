@@ -1,0 +1,81 @@
+import {useCallback,useEffect,useMemo,useRef,useState} from 'react';
+import DeckGL from '@deck.gl/react';
+import {H3HexagonLayer} from '@deck.gl/geo-layers';
+import {GeoJsonLayer,ScatterplotLayer} from '@deck.gl/layers';
+import {Map,useMap} from 'react-map-gl/maplibre';
+import type {MapRef} from 'react-map-gl/maplibre';
+import MapboxDraw from '@mapbox/mapbox-gl-draw';
+import type {FeatureCollection} from 'geojson';
+import * as h3 from 'h3-js';
+import 'maplibre-gl/dist/maplibre-gl.css';
+import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
+const API='http://localhost:8000';
+const BASEMAPS:any={liberty:{name:'Liberty',url:'https://tiles.openfreemap.org/styles/liberty'},bright:{name:'Bright',url:'https://tiles.openfreemap.org/styles/bright'},positron:{name:'Positron',url:'https://tiles.openfreemap.org/styles/positron'},dark:{name:'Dark',url:'https://tiles.openfreemap.org/styles/dark'},fiord:{name:'Fiord',url:'https://tiles.openfreemap.org/styles/fiord'},colorful:{name:'Colorful',url:'https://tiles.versatiles.org/assets/styles/colorful/style.json'}};
+type Dataset={dataset_id:number;dataset:string;data_type:string;h3_resolution:number;feature_count:number;part_count:number;boundary_h3_count:number};
+type Entity={entity_id:any;latitude:number;longitude:number;[key:string]:any};
+function rgb(hex:string){const n=parseInt(hex.replace('#',''),16);return[(n>>16)&255,(n>>8)&255,n&255]}
+function uniq<T>(a:T[]){return[...new Set(a)]}
+function bounds(fs:any[]){let a=[Infinity,Infinity],b=[-Infinity,-Infinity];const w=(x:any)=>Array.isArray(x)&&typeof x[0]==='number'?(a=[Math.min(a[0],x[0]),Math.min(a[1],x[1])],b=[Math.max(b[0],x[0]),Math.max(b[1],x[1])]):Array.isArray(x)&&x.forEach(w);fs.forEach(f=>w(f.geometry?.coordinates));return a[0]===Infinity?null:[a,b]}
+function DrawBridge({ready}:{ready:(d:MapboxDraw)=>void}){const {current}=useMap();useEffect(()=>{if(!current)return;const d=new MapboxDraw({displayControlsDefault:true});current.addControl(d as any,'top-right');ready(d);return()=>{try{current.removeControl(d as any)}catch{}}},[current,ready]);return null}
+export default function App(){
+ const mapRef=useRef<MapRef>(null),drawRef=useRef<MapboxDraw|null>(null);
+ const [page,setPage]=useState('map'),[datasets,setDatasets]=useState<Dataset[]>([]),[dataset,setDataset]=useState<Dataset|null>(null);
+ const [entities,setEntities]=useState<Entity[]>([]),[cells,setCells]=useState<string[]>([]),[resolution,setResolution]=useState(11);
+ const [h3Visible,setH3Visible]=useState(true),[entityVisible,setEntityVisible]=useState(true),[resultOpen,setResultOpen]=useState(false),[results,setResults]=useState<any[]>([]);
+ const [dark,setDark]=useState(localStorage.getItem('h3-theme')==='dark'),[basemap,setBasemap]=useState(localStorage.getItem('h3-basemap')||'liberty');
+ const [stats,setStats]=useState(false),[toast,setToast]=useState('');
+ const [colors,setColors]=useState({entity:'#2563eb',fill:'#2563eb',line:'#1d4ed8',opacity:.13});
+ const [ingMode,setIngMode]=useState<'file'|'draw'>('file'),[ingName,setIngName]=useState(''),[ingRes,setIngRes]=useState(11),[ingData,setIngData]=useState<FeatureCollection|null>(null),[preview,setPreview]=useState<any>(null);
+ const notify=(x:string)=>{setToast(x);setTimeout(()=>setToast(''),2200)};
+ const refresh=useCallback(async()=>{try{const d=await fetch(API+'/ingestion/datasets').then(r=>r.json());setDatasets(d.datasets||[])}catch{notify('API unavailable')}},[]);
+ useEffect(()=>{refresh()},[refresh]);
+ const load=useCallback(async(name:string)=>{const m=datasets.find(x=>x.dataset===name);if(!m)return;setDataset(m);setResolution(m.h3_resolution);
+  try{const r=await fetch(API+'/ingestion/dataset/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:name,limit:0,resolution:m.h3_resolution})});const d=await r.json();if(!r.ok)throw Error(d.detail||'preview failed');
+   const es=(d.features||[]).map((f:any)=>({entity_id:f.properties?.entity_id,latitude:f.geometry?.coordinates?.[1],longitude:f.geometry?.coordinates?.[0],...f.properties})).filter((x:any)=>Number.isFinite(x.latitude));
+   setEntities(es);setCells(uniq((d.features||[]).map((f:any)=>f.properties?.h3_index).filter(Boolean)));const b=bounds(d.features||[]);if(b)mapRef.current?.fitBounds(b as any,{padding:{top:90,bottom:90,left:360,right:60},maxZoom:15,duration:700});notify('แสดงข้อมูลทั้งหมดของ '+name)
+  }catch(e){notify(e instanceof Error?e.message:'Load failed')}
+ },[datasets]);
+ const display=useMemo(()=>uniq(cells.flatMap(c=>{try{const r=h3.getResolution(c);return resolution===r?[c]:resolution<r?[h3.cellToParent(c,resolution)]:h3.cellToChildren(c,resolution)}catch{return[]}})),[cells,resolution]);
+ const layers=useMemo(()=>[
+  new H3HexagonLayer({id:'h3-gpu',data:display.map(hex=>({hex})),pickable:true,highPrecision:'auto',filled:true,wireframe:true,
+   getHexagon:(d:any)=>d.hex,getFillColor:()=>[...rgb(colors.fill),Math.round(colors.opacity*255)] as any,getLineColor:()=>[...rgb(colors.line),255] as any,lineWidthMinPixels:1,visible:h3Visible,
+   onClick:(i:any)=>i.object&&(setResults([i.object]),setResultOpen(true))}),
+  new ScatterplotLayer({id:'entity-gpu',data:entities,pickable:true,getPosition:(d:any)=>[d.longitude,d.latitude],getRadius:45,radiusMinPixels:4,radiusMaxPixels:9,getFillColor:()=>[...rgb(colors.entity),230] as any,visible:entityVisible,
+   onClick:(i:any)=>i.object&&(setResults([i.object]),setResultOpen(true))}),
+  new GeoJsonLayer({id:'query-result',data:results.length?{type:'FeatureCollection',features:results.filter(x=>x.geometry)}:undefined,filled:true,stroked:true,getFillColor:[37,99,235,45],getLineColor:[37,99,235,220],getLineWidth:2})
+ ],[display,entities,colors,h3Visible,entityVisible,results]);
+ const runQuery=async()=>{if(!dataset)return notify('เลือก Dataset ก่อน');const field=(document.getElementById('qField') as HTMLSelectElement).value,op=(document.getElementById('qOp') as HTMLSelectElement).value,value=(document.getElementById('qValue') as HTMLInputElement).value;
+  const spatialType=(document.getElementById('qSpatial') as HTMLSelectElement).value,spatial:any={type:spatialType};if(spatialType==='nearby'){const c=mapRef.current?.getCenter();spatial.lat=c?.lat;spatial.lng=c?.lng;spatial.radius_m=Number((document.getElementById('qDistance') as HTMLInputElement).value||1000)}
+  if(spatialType==='bbox'){const b=mapRef.current?.getBounds();spatial.min_lat=b?.getSouth();spatial.max_lat=b?.getNorth();spatial.min_lng=b?.getWest();spatial.max_lng=b?.getEast()}
+  try{const r=await fetch(API+'/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:dataset.dataset,conditions:value?[{field,operator:op,value}]:[],spatial,limit:5000})});const d=await r.json();if(!r.ok)throw Error(d.detail||'Query failed');setResults(d.features||[]);setResultOpen(true);notify('Query สำเร็จ '+(d.features||[]).length.toLocaleString())}catch(e){notify(e instanceof Error?e.message:'Query failed')}};
+ const execute=async()=>{if(!ingData||!ingName)return notify('ใส่ Dataset Name และ source ก่อน');const r=await fetch(API+'/ingestion/geojson/execute?resolution='+ingRes+'&dataset='+encodeURIComponent(ingName),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ingData)});const d=await r.json();if(!r.ok)return notify(d.detail||'Execute failed');notify('Ingestion completed: '+d.dataset);await refresh();setPage('map')};
+ const file=async(f:File)=>{try{setIngData(JSON.parse(await f.text()));notify('โหลด GeoJSON แล้ว')}catch{notify('GeoJSON ไม่ถูกต้อง')}};
+ const ready=useCallback((d:MapboxDraw)=>{drawRef.current=d},[]);
+ const useDraw=()=>{const d=drawRef.current?.getAll();if(d?.features.length)setIngData(d);else notify('ยังไม่มีข้อมูลที่วาด')};
+ const style=dark?BASEMAPS.dark.url:BASEMAPS[basemap].url;
+ return <div className={dark?'app dark':'app'}><aside className="sidebar"><div className="brand"><b>H3 DATA PLATFORM</b><small>GPU SPATIAL DATA PLATFORM</small></div>
+ <Nav id="dashboard" p={page} set={setPage} t="▦ Dashboard"/><Nav id="datasets" p={page} set={setPage} t="▤ Datasets"/><Nav id="ingestion" p={page} set={setPage} t="↥ Ingestion"/><Nav id="map" p={page} set={setPage} t="⌖ Map"/><Nav id="analysis" p={page} set={setPage} t="⌁ Analysis"/><Nav id="settings" p={page} set={setPage} t="⚙ Settings"/>
+ <div className="sideFoot">React + TypeScript<br/>MapLibre + deck.gl H3</div></aside>
+ <main className="workspace"><header className="topbar"><b>{page}</b><input placeholder="Search dataset, entity, H3 index..."/><button onClick={()=>setStats(!stats)}>▥</button><button onClick={()=>setDark(!dark)}>{dark?'☾':'☀'}</button></header>
+ {page==='map'&&<section className="mapPage"><DeckGL initialViewState={{longitude:100.5018,latitude:13.7563,zoom:10}} controller layers={layers} getTooltip={(x:any)=>x.object?String(x.object.hex||x.object.entity_id||''):null}><Map ref={mapRef} mapStyle={style}/></DeckGL>
+ <MapPanel {...{datasets,dataset,load,resolution,setResolution,h3Visible,setH3Visible,entityVisible,setEntityVisible,colors,setColors,basemap,setBasemap,runQuery}}/>
+ {stats&&<div className="stats"><b>Dataset<br/>{dataset?.dataset||'—'}</b><b>Entities<br/>{dataset?.feature_count?.toLocaleString()||'—'}</b><b>H3<br/>GPU</b><b>Visible<br/>{display.length.toLocaleString()}</b></div>}
+ {resultOpen&&<Results data={results} close={()=>setResultOpen(false)}/>}</section>}
+ {page==='ingestion'&&<section className="page"><h2>Ingestion Pipeline</h2><p>GeoJSON หรือ Draw → Boundary H3</p><div className="grid2"><div className="card"><div className="buttonRow"><button className={ingMode==='file'?'primary':''} onClick={()=>setIngMode('file')}>📄 File / GeoJSON</button><button className={ingMode==='draw'?'primary':''} onClick={()=>setIngMode('draw')}>✏️ Draw</button></div><label>Dataset Name<input value={ingName} onChange={e=>setIngName(e.target.value)}/></label><label>H3 Resolution<select value={ingRes} onChange={e=>setIngRes(+e.target.value)}>{Array.from({length:11},(_,i)=><option key={i} value={i+5}>Res {i+5}</option>)}</select></label>
+ {ingMode==='file'?<label className="drop">Drop GeoJSON<input type="file" accept=".geojson,.json" onChange={e=>e.target.files?.[0]&&file(e.target.files[0])}/></label>:<><div className="drawMap"><Map mapStyle={style} initialViewState={{longitude:100.5018,latitude:13.7563,zoom:11}}><DrawBridge ready={ready}/></Map></div><div className="buttonRow"><button onClick={useDraw}>Use Drawing</button><button onClick={()=>drawRef.current?.changeMode('draw_point')}>Point</button><button onClick={()=>drawRef.current?.changeMode('draw_line_string')}>Line</button><button onClick={()=>drawRef.current?.changeMode('draw_polygon')}>Polygon</button><button onClick={()=>drawRef.current?.deleteAll()}>Clear</button></div></>}
+ <div className="buttonRow"><button onClick={async()=>{if(!ingData)return notify('เลือก source ก่อน');const r=await fetch(API+'/ingestion/geojson/preview?resolution='+ingRes,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ingData)});const d=await r.json();setPreview(d);notify(r.ok?'Preview ready':d.detail||'Preview failed')}}>Preview H3</button><button className="primary" onClick={execute}>Execute Pipeline</button></div></div><div className="card"><b>Preview</b><pre className="preview">{preview?JSON.stringify(preview,null,2):'Waiting for source'}</pre></div></div></section>}
+ {page==='datasets'&&<section className="page"><h2>Datasets</h2><button onClick={refresh}>Refresh</button><div className="card"><table><thead><tr><th>Dataset</th><th>Type</th><th>H3</th><th>Features</th><th>Boundary H3</th></tr></thead><tbody>{datasets.map(d=><tr key={d.dataset_id} onClick={()=>load(d.dataset)}><td>{d.dataset}</td><td>{d.data_type}</td><td>Res {d.h3_resolution}</td><td>{d.feature_count.toLocaleString()}</td><td>{d.boundary_h3_count.toLocaleString()}</td></tr>)}</tbody></table></div></section>}
+ {page==='dashboard'&&<section className="page"><h2>Dashboard</h2><div className="kpis"><b>{datasets.length}<small>Datasets</small></b><b>{entities.length.toLocaleString()}<small>Entities</small></b><b>{cells.length.toLocaleString()}<small>H3 Cells</small></b><b>WebGL<small>Renderer</small></b></div></section>}
+ {page==='analysis'&&<section className="page"><h2>Analysis</h2><div className="card">Dataset: {dataset?.dataset||'—'}<br/>Results: {results.length.toLocaleString()}</div></section>}
+ {page==='settings'&&<section className="page"><h2>Settings</h2><div className="card"><b>Renderer</b><p>React + TypeScript + Vite + MapLibre + deck.gl H3HexagonLayer</p><p>H3 indexes are rendered directly by the GPU. No cellToBoundary → GeoJSON conversion for display.</p></div></section>}
+ {toast&&<div className="toast">{toast}</div>}</main></div>
+}
+function Nav({id,p,set,t}:{id:string;p:string;set:(x:string)=>void;t:string}){return <button className={'nav '+(p===id?'active':'')} onClick={()=>set(id)}>{t}</button>}
+function MapPanel(p:any){return <aside className="panel left"><div className="section"><b>Dataset</b><select value={p.dataset?.dataset||''} onChange={e=>p.load(e.target.value)}><option value="">Select dataset</option>{p.datasets.map((d:any)=><option key={d.dataset}>{d.dataset}</option>)}</select><div className="card"><b>{p.dataset?.dataset||'No dataset'}</b><small>Res {p.dataset?.h3_resolution||'—'} · {p.dataset?.feature_count?.toLocaleString()||0} entities</small></div></div>
+ <div className="section"><b>Layers</b><Check t="Entities" v={p.entityVisible} s={p.setEntityVisible}/><Check t="H3 GPU" v={p.h3Visible} s={p.setH3Visible}/></div>
+ <div className="section"><b>Data Colors</b><label>Entity <input type="color" value={p.colors.entity} onChange={e=>p.setColors({...p.colors,entity:e.target.value})}/></label><label>H3 Fill <input type="color" value={p.colors.fill} onChange={e=>p.setColors({...p.colors,fill:e.target.value})}/></label><label>H3 Border <input type="color" value={p.colors.line} onChange={e=>p.setColors({...p.colors,line:e.target.value})}/></label><label>Opacity <input type="range" min="0" max="1" step=".01" value={p.colors.opacity} onChange={e=>p.setColors({...p.colors,opacity:+e.target.value})}/></label></div>
+ <div className="section"><b>H3 Display — Res {p.resolution}</b><input type="range" min="5" max="15" value={p.resolution} onChange={e=>p.setResolution(+e.target.value)}/><div className="resGrid">{Array.from({length:11},(_,i)=>i+5).map(r=><button className={r===p.resolution?'active':''} key={r} onClick={()=>p.setResolution(r)}>{r}</button>)}</div></div>
+ <div className="section"><b>Advanced Query</b><select id="qField"><option>attribute</option><option>properties.category</option><option>properties.name</option><option>entity_id</option><option>h3_index</option><option>resolution</option></select><select id="qOp"><option>=</option><option>!=</option><option>contains</option></select><input id="qValue" placeholder="value"/><select id="qSpatial"><option value="none">None</option><option value="nearby">Nearby</option><option value="bbox">BBox</option></select><input id="qDistance" type="number" defaultValue="1000"/><button className="primary full" onClick={p.runQuery}>Run Query</button></div>
+ <div className="section"><b>Basemap</b><select value={p.basemap} onChange={e=>p.setBasemap(e.target.value)}>{Object.entries(BASEMAPS).map(([k,v]:any)=><option key={k} value={k}>{v.name}</option>)}</select></div></aside>}
+function Check({t,v,s}:{t:string;v:boolean;s:(v:boolean)=>void}){return <label className="check"><input type="checkbox" checked={v} onChange={e=>s(e.target.checked)}/>{t}</label>}
+function Results({data,close}:{data:any[];close:()=>void}){return <aside className="panel results"><div className="panelHead"><b>Results ({data.length})</b><button onClick={close}>×</button></div><div className="resultList">{data.slice(0,500).map((x,i)=><div className="result" key={i}><b>{x.hex||x.entity_id||'Result'}</b><pre>{JSON.stringify(x,null,2)}</pre></div>)}</div></aside>}

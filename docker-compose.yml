@@ -29,10 +29,11 @@ services:
     volumes: [./data:/app/data, ./benchmarks:/app/benchmarks]
     command: ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--workers","4"]
   frontend:
-    image: nginx:alpine
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
     container_name: h3project-frontend
     ports: ["8080:80"]
-    volumes: [./frontend:/usr/share/nginx/html:ro]
     depends_on: [api]
 volumes:
   pgdata:
