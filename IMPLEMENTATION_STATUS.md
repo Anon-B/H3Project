@@ -38,6 +38,9 @@ Updated: 2026-10-01
 - [x] H3 analytics API (`GET /analytics/h3`)
 - [x] Dataset catalog fields: source, owner, version, format, coverage, tags, license, update frequency, schema, lineage
 - [x] Map analytics mode: Entity Count / Polygon Coverage
+- [x] MapLibre-native Draw ingestion: Point / Line / Polygon / Select / Edit / Clear
+- [x] Draw-to-Pipeline automatic GeoJSON sync
+- [x] Browser smoke test: Draw → Preview H3 → Execute → Dataset Registry
 
 ## Final dataset
 - Records: 10,000,000

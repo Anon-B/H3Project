@@ -1,76 +1,149 @@
-# GeoJSON Ingestion Pipeline — Web Guide
+# Ingestion Pipeline — GeoJSON / Draw
 
-## Goal
-หน้าเว็บสำหรับพัฒนา/ทดสอบ pipeline จาก GeoJSON → H3 Res11 / Res8 / Res5 ก่อนนำ logic ไปต่อกับ Polygon/Raster ingestion
+## เป้าหมาย
 
-## เปิดใช้งาน
-```bash
-cd /Users/anonpond/H3Project
-docker-compose up -d --build
+หน้าเว็บรองรับ 2 แหล่งข้อมูล:
+
+- File / GeoJSON
+- Draw บนแผนที่
+
+ทั้งสองทางเข้ากระบวนการเดียวกัน:
+
 ```
-เปิด `http://localhost:8080`
+Source
+  ↓
+GeoJSON FeatureCollection
+  ↓
+Preview H3
+  ↓
+Execute Pipeline
+  ↓
+Entity + Entity Part + Boundary H3
+  ↓
+H3 Analytics
+```
 
-## วิธีใช้งาน
-1. เลือกไฟล์ `.geojson/.json` หรือวาง GeoJSON ในช่องข้อความ
-2. กด **Load Sample** เพื่อทดลอง Point + Polygon
-3. กด **Preview H3** เพื่อคำนวณโดยยังไม่เขียน DB
-4. เลือก Res11 / Res8 / Res5 เพื่อดู grid บนแผนที่
-5. กด **Run Pipeline** เพื่อบันทึก ingestion run และ H3 cells ลง PostgreSQL
-6. กด **Download H3 GeoJSON** เพื่อ export grid ของ resolution ที่เลือก
+## Draw บนแผนที่
 
-## GeoJSON ที่รองรับ
-- `FeatureCollection`
-- `Feature`
-- Geometry เดี่ยว: `Point`, `MultiPoint`, `Polygon`, `MultiPolygon`, `GeometryCollection`
+หน้า **Ingestion → Draw** ใช้ `maplibre-gl-draw` กับ MapLibre โดยตรง
 
-### Point
-Point จะถูก map เป็น H3 cell เดียวในแต่ละ resolution:
-`lat/lng → Res11 → parent Res8 → parent Res5`
+เครื่องมือที่มี:
 
-### Polygon / MultiPolygon
-ใช้ H3 polyfill เพื่อสร้างทุก H3 cell ที่อยู่ภายใน geometry สำหรับแต่ละ resolution
+- **Point** — คลิกตำแหน่ง
+- **Line** — คลิกจุดตามแนวเส้น แล้ว double-click เพื่อจบ
+- **Polygon** — คลิกจุดรอบพื้นที่ แล้ว double-click เพื่อจบ
+- **Select / Move** — เลือกและย้าย feature
+- **Edit Vertices** — แก้ไข vertex ของ feature ที่เลือก
+- **Use Drawing** — sync drawing ปัจจุบันเข้า Pipeline
+- **Clear** — ลบ drawing ทั้งหมด
 
-> Res11 สามารถสร้างจำนวน cell มากเมื่อ polygon ใหญ่ จึงควร Preview ก่อน Run และใน production ควรมี cell-count guard / asynchronous job
+เมื่อวาดเสร็จ ระบบรับ `draw.create`, `draw.update` และ `draw.delete` แล้ว sync เข้า `ingData` อัตโนมัติ ดังนั้น Preview และ Execute ใช้ข้อมูลที่วาดจริง
 
-## API
-### Preview
-`POST /ingestion/geojson/preview`
+## Preview H3
 
-รับ GeoJSON โดยตรงและคืน:
-- feature_count
-- cell_counts
-- unique_cells
-- H3 list ต่อ feature
+กด **Preview H3**
 
-Preview **ไม่เขียน DB**
+ระบบเรียก:
 
-### Execute
-`POST /ingestion/geojson/execute`
+`POST /ingestion/geojson/preview?resolution=<5..15>`
 
-ทำเหมือน Preview แล้วบันทึก:
+Preview ไม่เขียน Entity ลงฐานข้อมูล
+
+ใช้ตรวจ:
+
+- จำนวน Feature
+- จำนวน Boundary H3
+- จำนวน display H3
+- geometry ที่แปลงสำเร็จ/ผิดพลาด
+
+## Execute Pipeline
+
+กด **Execute Pipeline**
+
+ระบบเรียก:
+
+`POST /ingestion/geojson/execute?resolution=<5..15>&dataset=<name>`
+
+และสร้าง:
+
+- `datasets`
+- `entities`
+- `entity_parts`
+- `entity_part_h3`
+- `h3_features`
 - `ingestion_runs`
+- `ingestion_parts`
 - `ingestion_h3_cells`
 
-คืน `run_id` และจำนวน H3 ที่สร้าง
+## รูปแบบการเก็บ
 
-### Runs
-`GET /ingestion/runs`
+Polygon:
 
-ดูประวัติ ingestion run
+```
+Polygon
+  ↓
+Boundary H3
+  ├── outer
+  └── hole
+```
 
-`GET /ingestion/runs/{run_id}`
+MultiPolygon:
 
-ดูรายละเอียด run และจำนวน cell แยก Res5/8/11
+```
+Feature
+  ├── Part 0 → Boundary H3
+  └── Part 1 → Boundary H3
+```
 
-## ตารางที่ใช้
-`ingestion_runs` เป็น metadata ของ pipeline run  
-`ingestion_h3_cells` เป็น normalized H3 output: 1 row ต่อ feature × resolution × H3 cell
+Point:
 
-ตาราง ingestion แยกจาก `spatial_entities` เพื่อให้ทดลอง pipeline ได้โดยไม่กระทบ dataset production POC 10M
+- เก็บ latitude / longitude
+- เก็บ H3 cell
 
-## Output semantics
-- Res11 = object/high-detail index
-- Res8 = medium aggregation
-- Res5 = coarse aggregation
-- H3 เป็น index/grid ไม่ใช่ exact polygon boundary
-- Polygon H3 output เป็น analytical tessellation และไม่ควรนำไปตีความว่าเป็นขอบเขตจริงของ polygon
+Line:
+
+- เก็บ H3 coverage ตามแนวเส้น
+
+Original Polygon geometry ไม่ถูกเก็บใน canonical storage
+
+## H3 Analytics
+
+ข้อมูลที่ derive เพิ่มใน `h3_features`:
+
+- `h3_index`
+- `resolution`
+- `feature_type`
+- `cell_coverage`
+- `polygon_coverage`
+- `centroid_cell`
+- `pixel_coverage`
+- `properties`
+
+API:
+
+`GET /analytics/h3?dataset=<name>&resolution=<5..15>`
+
+ใช้สำหรับ aggregation และ Map analytics
+
+## Map
+
+หลัง Execute สามารถ:
+
+1. ไปที่ **Datasets**
+2. เปิด Dataset
+3. กด **Map**
+
+แล้วเลือก:
+
+- H3 Display Resolution
+- Data Colors
+- Entity / H3 layer
+- Analytics metric
+- 3D Extrude
+- Height
+
+## ข้อควรระวัง
+
+Res สูงกับ polygon ใหญ่สามารถสร้าง H3 จำนวนมาก ควร Preview ก่อน Execute
+
+H3 Boundary เป็น spatial representation ที่ใช้ลด storage และสำหรับ analytics ไม่ใช่สำเนา polygon เดิมแบบ lossless
