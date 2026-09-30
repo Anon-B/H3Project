@@ -1,0 +1,1 @@
+{"type":"FeatureCollection","features":[{"type":"Feature","id":"p1","geometry":{"type":"Point","coordinates":[100.5018,13.7563]},"properties":{"name":"test"}},{"type":"Feature","id":"poly1","geometry":{"type":"Polygon","coordinates":[[[100.49,13.75],[100.51,13.75],[100.51,13.765],[100.49,13.765],[100.49,13.75]]]},"properties":{"name":"area"}}]}
