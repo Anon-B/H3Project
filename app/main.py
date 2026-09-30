@@ -1,5 +1,6 @@
 import os,time,json
 import h3,orjson,redis
+from pyproj import Geod
 from shapely.geometry import shape,Polygon,MultiPolygon,mapping
 from shapely.ops import unary_union
 from psycopg_pool import ConnectionPool
@@ -11,7 +12,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 DB=os.getenv("DATABASE_URL","postgresql://h3:h3@db:5432/h3project")
 REDIS=os.getenv("REDIS_URL","redis://redis:6379/0")
 API_KEY=os.getenv("API_KEY","")
-app=FastAPI(title="H3Project API",version="0.6.0",default_response_class=ORJSONResponse)
+GEOD=Geod(ellps="WGS84")
+app=FastAPI(title="H3Project API",version="0.7.0",default_response_class=ORJSONResponse)
 rdb=redis.Redis.from_url(REDIS,decode_responses=True)
 pool=ConnectionPool(DB,min_size=2,max_size=20,open=True)
 
@@ -110,6 +112,47 @@ def _geometry_parts(geometry,res):
                 part["part_index"]=idx;idx+=1;out.append(part)
         return out
     raise ValueError(f"unsupported geometry type: {t}")
+
+def _geodesic_area(geom):
+    if geom is None or geom.is_empty:return 0.0
+    gt=geom.geom_type
+    if gt=="Polygon":
+        x,y=geom.exterior.xy;area=abs(GEOD.polygon_area_perimeter(x,y)[0])
+        for hole in geom.interiors:
+            x,y=hole.xy;area-=abs(GEOD.polygon_area_perimeter(x,y)[0])
+        return max(0.0,area)
+    if gt=="MultiPolygon":return sum(_geodesic_area(g) for g in geom.geoms)
+    if hasattr(geom,"geoms"):return sum(_geodesic_area(g) for g in geom.geoms)
+    return 0.0
+
+def _analytics_for_part(part,res):
+    out=[];ptype=part["part_type"]
+    if ptype=="point":
+        for _,_,cell in part["cells"]:out.append((cell,1.0,1.0,True,None))
+        return out
+    if ptype=="line":
+        coords=part["rings"][0][2]
+        geom=shape({"type":"LineString","coordinates":coords})
+        centroid=geom.centroid
+        centroid_cell=h3.latlng_to_cell(float(centroid.y),float(centroid.x),res)
+        for _,_,cell in part["cells"]:out.append((cell,None,None,cell==centroid_cell,None))
+        return out
+    rings=part["rings"]
+    holes=[[(float(x),float(y)) for x,y in r[2]] for _,_,r in rings[1:]]
+    geom=Polygon([(float(x),float(y)) for x,y in rings[0][2]],holes)
+    part_area=_geodesic_area(geom)
+    centroid=geom.centroid
+    centroid_cell=h3.latlng_to_cell(float(centroid.y),float(centroid.x),res)
+    cells=_overlap_cells({"type":"Polygon","coordinates":[ring for _,_,ring in rings]},res)
+    for cell in cells:
+        cell_ring=[(float(lng),float(lat)) for lat,lng in h3.cell_to_boundary(cell)]
+        cell_geom=Polygon(cell_ring)
+        overlap=_geodesic_area(geom.intersection(cell_geom))
+        cell_area=h3.cell_area(cell,unit="m^2")
+        cell_cov=min(1.0,max(0.0,overlap/cell_area if cell_area else 0.0))
+        poly_cov=min(1.0,max(0.0,overlap/part_area if part_area else 0.0))
+        out.append((cell,cell_cov,poly_cov,cell==centroid_cell,None))
+    return out
 
 def _part_bbox(part):
     pts=[]
@@ -216,6 +259,8 @@ def metrics():
 @app.get("/ingestion/datasets")
 def ingestion_datasets(limit:int=Query(100,ge=1,le=500)):
     sql="""SELECT d.dataset_id,d.name,d.data_type,d.h3_resolution,d.metadata,d.created_at,d.updated_at,
+                  d.source,d.owner,d.version,d.source_format,d.geographic_coverage,d.tags,d.license,d.update_frequency,
+                  d.schema_definition,d.lineage,
                   count(DISTINCT e.entity_id),count(DISTINCT p.part_id),count(DISTINCT h.h3_index)
            FROM datasets d LEFT JOIN entities e ON e.dataset_id=d.dataset_id
            LEFT JOIN entity_parts p ON p.entity_id=e.entity_id
@@ -225,11 +270,16 @@ def ingestion_datasets(limit:int=Query(100,ge=1,le=500)):
         with c.cursor() as cur:cur.execute(sql,(limit,));rows=cur.fetchall()
     return {"datasets":[{"dataset_id":x[0],"dataset":x[1],"data_type":x[2],"h3_resolution":x[3],
                          "metadata":x[4] or {},"created_at":x[5],"updated_at":x[6],
-                         "feature_count":x[7],"part_count":x[8],"boundary_h3_count":x[9]} for x in rows]}
+                         "source":x[7],"owner":x[8],"version":x[9],"source_format":x[10],
+                         "geographic_coverage":x[11] or {},"tags":x[12] or [],"license":x[13],
+                         "update_frequency":x[14],"schema":x[15] or {},"lineage":x[16] or {},
+                         "feature_count":x[17],"part_count":x[18],"boundary_h3_count":x[19]} for x in rows]}
 
 @app.get("/datasets/{dataset_id}")
 def dataset_detail(dataset_id:int):
     sql="""SELECT d.dataset_id,d.name,d.data_type,d.h3_resolution,d.metadata,d.created_at,d.updated_at,
+                  d.source,d.owner,d.version,d.source_format,d.geographic_coverage,d.tags,d.license,d.update_frequency,
+                  d.schema_definition,d.lineage,
                   count(DISTINCT e.entity_id),count(DISTINCT p.part_id),count(DISTINCT h.h3_index)
            FROM datasets d LEFT JOIN entities e ON e.dataset_id=d.dataset_id
            LEFT JOIN entity_parts p ON p.entity_id=e.entity_id
@@ -239,27 +289,37 @@ def dataset_detail(dataset_id:int):
         with c.cursor() as cur:cur.execute(sql,(dataset_id,));x=cur.fetchone()
     if not x:raise HTTPException(404,"dataset not found")
     return {"dataset_id":x[0],"name":x[1],"data_type":x[2],"h3_resolution":x[3],"metadata":x[4] or {},
-            "created_at":x[5],"updated_at":x[6],"entity_count":x[7],"part_count":x[8],
-            "boundary_h3_count":x[9],"storage_mode":"boundary_h3"}
+            "created_at":x[5],"updated_at":x[6],"source":x[7],"owner":x[8],"version":x[9],"source_format":x[10],
+            "geographic_coverage":x[11] or {},"tags":x[12] or [],"license":x[13],"update_frequency":x[14],
+            "schema":x[15] or {},"lineage":x[16] or {},"entity_count":x[17],"part_count":x[18],
+            "boundary_h3_count":x[19],"storage_mode":"boundary_h3"}
 
 @app.patch("/datasets/{dataset_id}")
 def update_dataset(dataset_id:int,body:dict=Body(...)):
-    allowed={"name","metadata","h3_resolution"};changes={k:v for k,v in body.items() if k in allowed}
+    allowed={"name","metadata","h3_resolution","source","owner","version","source_format","geographic_coverage","tags","license","update_frequency","schema","lineage"};changes={k:v for k,v in body.items() if k in allowed}
     if not changes:raise HTTPException(400,"nothing to update")
     if "h3_resolution" in changes and not 5<=int(changes["h3_resolution"])<=15:
         raise HTTPException(400,"resolution must be 5..15")
     sets=[];vals=[]
     if "name" in changes:sets.append("name=%s");vals.append(str(changes["name"]).strip())
     if "metadata" in changes:sets.append("metadata=%s");vals.append(json.dumps(changes["metadata"] or {}))
+    for key in ["source","owner","version","source_format","license","update_frequency"]:
+        if key in changes:sets.append(key+"=%s");vals.append(str(changes[key] or ""))
+    for key in ["geographic_coverage","schema_definition","lineage"]:
+        body_key="schema" if key=="schema_definition" else key
+        if body_key in changes:sets.append(key+"=%s");vals.append(json.dumps(changes[body_key] or {}))
+    if "tags" in changes:sets.append("tags=%s");vals.append(list(changes["tags"] or []))
     if "h3_resolution" in changes:sets.append("h3_resolution=%s");vals.append(int(changes["h3_resolution"]))
     with db_conn() as c:
         with c.cursor() as cur:
             cur.execute("SELECT 1 FROM datasets WHERE dataset_id=%s",(dataset_id,))
             if not cur.fetchone():raise HTTPException(404,"dataset not found")
             vals.append(dataset_id)
-            cur.execute("UPDATE datasets SET "+",".join(sets)+",updated_at=now() WHERE dataset_id=%s RETURNING dataset_id,name,data_type,h3_resolution,metadata,updated_at",vals)
+            cur.execute("UPDATE datasets SET "+",".join(sets)+",updated_at=now() WHERE dataset_id=%s RETURNING dataset_id,name,data_type,h3_resolution,metadata,updated_at,source,owner,version,source_format,geographic_coverage,tags,license,update_frequency,schema_definition,lineage",vals)
             x=cur.fetchone();c.commit()
-    return {"dataset_id":x[0],"name":x[1],"data_type":x[2],"h3_resolution":x[3],"metadata":x[4] or {},"updated_at":x[5]}
+    return {"dataset_id":x[0],"name":x[1],"data_type":x[2],"h3_resolution":x[3],"metadata":x[4] or {},"updated_at":x[5],
+            "source":x[6],"owner":x[7],"version":x[8],"source_format":x[9],"geographic_coverage":x[10] or {},
+            "tags":x[11] or [],"license":x[12],"update_frequency":x[13],"schema":x[14] or {},"lineage":x[15] or {}}
 
 @app.delete("/datasets/{dataset_id}")
 def delete_dataset(dataset_id:int):
@@ -301,6 +361,15 @@ def _insert_feature(cur,entity_id,dataset_id,feature,res,run_id=None):
             cur.execute("""INSERT INTO entity_point(entity_id,latitude,longitude)
                            VALUES (%s,%s,%s) ON CONFLICT(entity_id) DO NOTHING""",
                         (entity_id,float(p[1]),float(p[0])))
+        analytics=_analytics_for_part(part,res)
+        for cell,cell_cov,poly_cov,is_centroid,pixel_cov in analytics:
+            cur.execute("""INSERT INTO h3_features(
+                           dataset_id,entity_id,part_id,resolution,h3_index,feature_type,
+                           cell_coverage,polygon_coverage,centroid_cell,pixel_coverage,properties)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT DO NOTHING""",
+                        (dataset_id,entity_id,part_id,res,cell,part["part_type"],cell_cov,poly_cov,
+                         is_centroid,pixel_cov,json.dumps(props)))
         for ring_id,ring_type,cell in part["cells"]:
             cur.execute("""INSERT INTO entity_part_h3(
                            part_id,resolution,ring_id,ring_type,h3_index)
@@ -326,8 +395,10 @@ def _execute_ingestion(payload,res,dataset_name=None):
             cur.execute("SELECT dataset_id FROM datasets WHERE name=%s",(name,));existing=cur.fetchone()
             if existing:dataset_id=existing[0]
             else:
-                cur.execute("INSERT INTO datasets(name,data_type,h3_resolution,metadata) VALUES (%s,%s,%s,%s) RETURNING dataset_id",
-                            (name,dtype,res,json.dumps({"storage_mode":"boundary_h3"})));dataset_id=cur.fetchone()[0]
+                cur.execute("""INSERT INTO datasets(
+                           name,data_type,h3_resolution,metadata,source,source_format)
+                           VALUES (%s,%s,%s,%s,%s,%s) RETURNING dataset_id""",
+                            (name,dtype,res,json.dumps({"storage_mode":"boundary_h3"}),"geojson","GeoJSON"));dataset_id=cur.fetchone()[0]
             cur.execute("""INSERT INTO ingestion_runs(dataset_id,source_type,input_feature_count,output_cell_count,status,metadata)
                            VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
                         (dataset_id,"geojson",preview["feature_count"],preview["boundary_cells"],"running",
@@ -485,6 +556,27 @@ def advanced_query(body:dict=Body(...)):
         features.append({"type":"Feature","geometry":None,"properties":props})
     return {"type":"FeatureCollection","features":features,
             "meta":{"count":len(features),"limit":limit,"spatial_type":stype,"storage_mode":"boundary_h3"}}
+
+@app.get("/analytics/h3")
+def h3_analytics(dataset:str|None=None,resolution:int=Query(11,ge=5,le=15),limit:int=Query(50000,ge=1,le=200000)):
+    sql="""SELECT h.h3_index,
+                  count(DISTINCT h.entity_id) AS entity_count,
+                  count(*) AS feature_count,
+                  avg(h.cell_coverage) AS avg_cell_coverage,
+                  max(h.polygon_coverage) AS polygon_coverage,
+                  bool_or(h.centroid_cell) AS centroid_cell
+           FROM h3_features h
+           WHERE h.resolution=%s"""
+    params=[resolution]
+    if dataset:
+        sql+=" AND EXISTS (SELECT 1 FROM datasets d WHERE d.dataset_id=h.dataset_id AND d.name=%s)"
+        params.append(dataset)
+    sql+=" GROUP BY h.h3_index ORDER BY entity_count DESC,h.h3_index LIMIT %s";params.append(limit)
+    with db_conn() as c:
+        with c.cursor() as cur:cur.execute(sql,params);rows=cur.fetchall()
+    return {"rows":[{"h3_index":x[0],"entity_count":x[1],"feature_count":x[2],
+                     "avg_cell_coverage":x[3],"polygon_coverage":x[4],"centroid_cell":bool(x[5])} for x in rows],
+            "meta":{"dataset":dataset,"resolution":resolution,"count":len(rows),"source":"h3_features"}}
 
 @app.get("/summary")
 def summary(res:int=Query(5,ge=5,le=15),dataset:str|None=None):

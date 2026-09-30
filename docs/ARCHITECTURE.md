@@ -1,12 +1,15 @@
 # Architecture
 
 ## Layers
-1. Raw: synthetic/source-like input
-2. Silver: one row per spatial entity + H3 Res 11/8/5
-3. Gold: counts/metrics aggregated by H3
-4. Redis: hot cache for coarse summaries
-5. API: broad-phase → narrow-phase → GeoJSON
-6. Frontend: map rendering by zoom
+1. Raw: source input such as GeoJSON (and future raster sources)
+2. Canonical spatial store: entities + parts + Boundary H3
+3. H3 Analytics: derived `h3_features` with H3 rows, entity counts and polygon coverage metrics
+4. Gold: counts/metrics aggregated by H3 for summaries and map analytics
+5. Redis: hot cache for coarse summaries
+6. API: spatial query + analytics + dataset catalog
+7. Frontend: MapLibre camera/map controls + deck.gl GPU H3 rendering
+
+`h3_features` is derived data; it does not replace Boundary H3. Original source geometry is still not persisted.
 
 ## Spatial query
 Radius/BBox first derives candidate H3 cells. Database then performs exact PostGIS filtering.

@@ -54,6 +54,27 @@ Records the source feature part created during a pipeline run.
 
 Pipeline output H3 records, including ring metadata. Polygon rows represent stored boundary H3; Line rows represent line coverage H3.
 
+## h3_features
+
+| Column | Meaning |
+|---|---|
+| h3_feature_id | Analytics row identifier |
+| dataset_id | Dataset |
+| entity_id | Source entity |
+| part_id | Source spatial part |
+| resolution | H3 resolution |
+| h3_index | Analytics H3 cell |
+| feature_type | point, line, polygon |
+| cell_coverage | Fraction of the H3 cell covered by a polygon |
+| polygon_coverage | Fraction of the source polygon part covered by the H3 cell |
+| centroid_cell | H3 cell contains the part centroid |
+| pixel_coverage | Raster pixel coverage; nullable for vector |
+| properties | Copied source attributes |
+
+## datasets catalog fields
+
+`source`, `owner`, `version`, `source_format`, `geographic_coverage`, `tags`, `license`, `update_frequency`, `schema_definition`, `lineage`
+
 ## entity_h3 compatibility view
 
 The entity_h3 view exposes entity_id, resolution and h3_index from entity_part_h3 for simple legacy H3 lookups.

@@ -2,6 +2,15 @@
 
 Base URL: `http://localhost:8000`
 
+## GET /analytics/h3
+`dataset`, `resolution=5..15`, `limit`
+Returns one aggregated row per H3 cell from the `h3_features` analytics layer. Includes entity count, feature count, coverage values and centroid-cell flag.
+
+Example:
+```bash
+curl 'http://localhost:8000/analytics/h3?dataset=api-test&resolution=11&limit=10'
+```
+
 ## GET /summary
 `res=5|8`, `cache=true|false`  
 Returns H3 summary polygons as GeoJSON. `source` tells whether Redis or DB supplied the data. Cache TTL is 300 seconds.

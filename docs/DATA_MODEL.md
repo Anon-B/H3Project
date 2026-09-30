@@ -77,6 +77,21 @@ Nearby: exact point distance for entity_point.
 
 Line: H3 coverage lookup.
 
+## H3 Analytics layer
+
+`h3_features` is a derived analytics table. It does not replace `entity_part_h3`.
+
+- `entity_part_h3` = canonical Boundary H3 storage for compact spatial representation.
+- `h3_features` = analytics-oriented H3 rows for counting, coverage and map metrics.
+- Polygon rows can store `cell_coverage` (fraction of cell covered) and `polygon_coverage` (fraction of part area covered).
+- `centroid_cell` marks the H3 cell containing the part centroid.
+- `pixel_coverage` is reserved for raster-derived coverage and is nullable for vector data.
+- Original geometry is still not persisted.
+
+## Dataset Catalog
+
+`datasets` now also supports source, owner, version, source format, geographic coverage, tags, license, update frequency, schema and lineage.
+
 ## Compatibility
 
 entity_h3 is exposed as a view over entity_part_h3 so simple H3 lookup code can continue to work.
