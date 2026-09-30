@@ -501,6 +501,30 @@ def ingestion_dataset_preview(body:dict=Body(...)):
     return {"type":"FeatureCollection","features":features,
             "meta":{"dataset":name,"resolution":res,"entity_count":len(entities),"display_mode":"reconstructed_fill"}}
 
+@app.get("/ingestion/dataset/h3")
+def ingestion_dataset_h3(dataset:str, resolution:int=Query(11,ge=5,le=15)):
+    name=dataset.strip()
+    if not name:raise HTTPException(400,"dataset is required")
+    rows=_dataset_rows(name,0,resolution)
+    if not rows:raise HTTPException(404,"dataset not found or empty")
+    by_entity={}
+    all_cells=set()
+    for x in rows:
+        parts=by_entity.setdefault(x[0],{})
+        part=parts.setdefault(x[5],{"part_type":x[6],"res":x[15] or resolution,"rows":[]})
+        if x[14]:part["rows"].append((x[12],x[13],x[14]))
+    for parts in by_entity.values():
+        for part in parts.values():all_cells.update(_display_cells_for_part_rows(part["rows"],part["res"]))
+    entity_h3=[]
+    with db_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("""SELECT DISTINCT ON (h.entity_id) h.entity_id,h.h3_index
+                           FROM h3_features h JOIN datasets d ON d.dataset_id=h.dataset_id
+                           WHERE d.name=%s AND h.resolution=%s
+                           ORDER BY h.entity_id,h.centroid_cell DESC,h.h3_index""",(name,resolution))
+            entity_h3=[{"entity_id":x[0],"h3_index":x[1]} for x in cur.fetchall()]
+    return {"dataset":name,"resolution":resolution,"h3":sorted(all_cells),"entity_h3":entity_h3}
+
 @app.post("/query")
 def advanced_query(body:dict=Body(...)):
     dataset=str(body.get("dataset") or "").strip() or None

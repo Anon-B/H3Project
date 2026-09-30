@@ -41,6 +41,7 @@ Updated: 2026-10-01
 - [x] MapLibre-native Draw ingestion: Point / Line / Polygon / Select / Edit / Clear
 - [x] Draw-to-Pipeline automatic GeoJSON sync
 - [x] Browser smoke test: Draw → Preview H3 → Execute → Dataset Registry
+- [x] Dataset Map load switched to H3-ID-only API; frontend H3HexagonLayer generates display cells client-side
 
 ## Final dataset
 - Records: 10,000,000

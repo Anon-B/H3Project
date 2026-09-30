@@ -16,7 +16,7 @@ type Dataset={dataset_id:number;dataset:string;data_type:string;h3_resolution:nu
 type Entity={entity_id:any;latitude:number;longitude:number;[key:string]:any};
 function rgb(hex:string){const n=parseInt(hex.replace('#',''),16);return[(n>>16)&255,(n>>8)&255,n&255]}
 function uniq<T>(a:T[]){return[...new Set(a)]}
-function bounds(fs:any[]){let a=[Infinity,Infinity],b=[-Infinity,-Infinity];const w=(x:any)=>Array.isArray(x)&&typeof x[0]==='number'?(a=[Math.min(a[0],x[0]),Math.min(a[1],x[1])],b=[Math.max(b[0],x[0]),Math.max(b[1],x[1])]):Array.isArray(x)&&x.forEach(w);fs.forEach(f=>w(f.geometry?.coordinates));return a[0]===Infinity?null:[a,b]}
+function h3Bounds(cells:string[]){let a=[Infinity,Infinity],b=[-Infinity,-Infinity];for(const cell of cells){try{const [lat,lng]=h3.cellToLatLng(cell);a=[Math.min(a[0],lng),Math.min(a[1],lat)];b=[Math.max(b[0],lng),Math.max(b[1],lat)]}catch{}}return a[0]===Infinity?null:[a,b]}
 function DeckGLOverlay({layers}:{layers:any[]}){const overlay=useControl<MapLibreOverlay>(()=>new MapLibreOverlay({interleaved:true,layers}));overlay.setProps({layers,interleaved:true});return null}
 function DrawBridge({ready,onChange}:{ready:(d:MapboxDraw|null)=>void;onChange:(fc:FeatureCollection)=>void}){const {current}=useMap();useEffect(()=>{const map=current as any;if(!map)return;let draw:MapboxDraw|null=null;let disposed=false;const sync=()=>{if(draw&&!disposed)onChange(draw.getAll() as FeatureCollection)};const attach=()=>{if(disposed||draw)return;draw=new MapboxDraw({displayControlsDefault:false,controls:{point:false,line_string:false,polygon:false,trash:false}});map.addControl(draw as any,'top-right');ready(draw);sync();for(const event of ['draw.create','draw.update','draw.delete','draw.combine','draw.uncombine'])map.on(event,sync)};if(typeof map.loaded==='function'&&map.loaded())attach();else map.once('load',attach);return()=>{disposed=true;for(const event of ['draw.create','draw.update','draw.delete','draw.combine','draw.uncombine']){try{map.off(event,sync)}catch{}}if(draw){try{map.removeControl(draw as any)}catch{}}ready(null);draw=null}},[current,ready,onChange]);return null}
 export default function App(){
@@ -37,12 +37,13 @@ export default function App(){
  const refresh=useCallback(async()=>{try{const d=await fetch(API+'/ingestion/datasets').then(r=>r.json());setDatasets(d.datasets||[])}catch{notify('API unavailable')}},[]);
  useEffect(()=>{refresh()},[refresh]);
  const load=useCallback(async(name:string)=>{const m=datasets.find(x=>x.dataset===name);if(!m)return;setDataset(m);setResolution(m.h3_resolution);
-  try{const r=await fetch(API+'/ingestion/dataset/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:name,limit:0,resolution:m.h3_resolution})});const d=await r.json();if(!r.ok)throw Error(d.detail||'preview failed');
-   const es=(d.features||[]).map((f:any)=>({entity_id:f.properties?.entity_id,latitude:f.geometry?.coordinates?.[1],longitude:f.geometry?.coordinates?.[0],...f.properties})).filter((x:any)=>Number.isFinite(x.latitude));
-   setEntities(es);setCells(uniq((d.features||[]).map((f:any)=>f.properties?.h3_index).filter(Boolean)));
+  try{const r=await fetch(API+'/ingestion/dataset/h3?dataset='+encodeURIComponent(name)+'&resolution='+m.h3_resolution);const d=await r.json();if(!r.ok)throw Error(d.detail||'H3 load failed');
+   const hs:string[]=uniq(((d.h3||[]) as unknown[]).filter((x):x is string=>typeof x==='string'&&x.length>0));
+   const es=(d.entity_h3||[]).map((x:any)=>{try{const [lat,lng]=h3.cellToLatLng(x.h3_index);return {entity_id:x.entity_id,latitude:lat,longitude:lng,h3_index:x.h3_index}}catch{return null}}).filter((x:any):x is Entity=>x!==null);
+   setEntities(es);setCells(hs);
    try{const ar=await fetch(API+'/analytics/h3?dataset='+encodeURIComponent(name)+'&resolution='+m.h3_resolution+'&limit=50000').then(x=>x.json());setAnalyticsRows(ar.rows||[])}catch{setAnalyticsRows([])}
-   const b=bounds(d.features||[]);if(b)mapRef.current?.fitBounds(b as any,{padding:{top:90,bottom:90,left:360,right:60},maxZoom:15,duration:700});notify('แสดงข้อมูลทั้งหมดของ '+name)
-  }catch(e){notify(e instanceof Error?e.message:'Load failed')}
+   const b=h3Bounds(hs);if(b)mapRef.current?.fitBounds(b as any,{padding:{top:90,bottom:90,left:360,right:60},maxZoom:15,duration:700});notify('โหลด H3 '+hs.length.toLocaleString()+' cells ของ '+name)
+  }catch(e){notify(e instanceof Error?e.message:'H3 load failed')}
  },[datasets]);
  const display=useMemo(()=>{const out=uniq(cells.flatMap(c=>{try{const r=h3.getResolution(c);return resolution===r?[c]:resolution<r?[h3.cellToParent(c,resolution)]:resolution-r>4?[]:h3.cellToChildren(c,resolution)}catch{return[]}}));return out.slice(0,250000)},[cells,resolution]);
  const analyticsMap=useMemo(()=>new globalThis.Map<string,any>(analyticsRows.map(x=>[x.h3_index,x])),[analyticsRows]);

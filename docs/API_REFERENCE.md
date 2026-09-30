@@ -2,6 +2,15 @@
 
 Base URL: `http://localhost:8000`
 
+## GET /ingestion/dataset/h3
+Parameters: `dataset`, `resolution=5..15`.
+Returns H3 cell IDs for Map rendering. The response does not contain Polygon coordinates or GeoJSON geometry. `entity_h3` provides one H3 anchor per entity so the frontend can derive an entity marker position with `h3-js`.
+
+Example:
+```bash
+curl 'http://localhost:8000/ingestion/dataset/h3?dataset=api-test&resolution=11'
+```
+
 ## GET /analytics/h3
 `dataset`, `resolution=5..15`, `limit`
 Returns one aggregated row per H3 cell from the `h3_features` analytics layer. Includes entity count, feature count, coverage values and centroid-cell flag.
