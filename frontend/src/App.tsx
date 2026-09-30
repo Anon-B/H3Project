@@ -17,7 +17,7 @@ type Entity={entity_id:any;latitude:number;longitude:number;[key:string]:any};
 function rgb(hex:string){const n=parseInt(hex.replace('#',''),16);return[(n>>16)&255,(n>>8)&255,n&255]}
 function uniq<T>(a:T[]){return[...new Set(a)]}
 function bounds(fs:any[]){let a=[Infinity,Infinity],b=[-Infinity,-Infinity];const w=(x:any)=>Array.isArray(x)&&typeof x[0]==='number'?(a=[Math.min(a[0],x[0]),Math.min(a[1],x[1])],b=[Math.max(b[0],x[0]),Math.max(b[1],x[1])]):Array.isArray(x)&&x.forEach(w);fs.forEach(f=>w(f.geometry?.coordinates));return a[0]===Infinity?null:[a,b]}
-function DeckGLOverlay({layers}:{layers:any[]}){const overlay=useControl<MapLibreOverlay>(()=>new MapLibreOverlay({interleaved:false,layers}));overlay.setProps({layers});return null}
+function DeckGLOverlay({layers}:{layers:any[]}){const overlay=useControl<MapLibreOverlay>(()=>new MapLibreOverlay({interleaved:true,layers}));overlay.setProps({layers,interleaved:true});return null}
 function DrawBridge({ready}:{ready:(d:MapboxDraw)=>void}){const {current}=useMap();useEffect(()=>{if(!current)return;const d=new MapboxDraw({displayControlsDefault:true});current.addControl(d as any,'top-right');ready(d);return()=>{try{current.removeControl(d as any)}catch{}}},[current,ready]);return null}
 export default function App(){
  const mapRef=useRef<MapRef>(null),drawRef=useRef<MapboxDraw|null>(null);
