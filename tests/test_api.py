@@ -27,7 +27,7 @@ def test_h3_analytics():
     r=httpx.get(BASE+"/analytics/h3?dataset=api-test&resolution=11&limit=10",timeout=10)
     assert r.status_code==200
     body=r.json()
-    assert body["meta"]["source"]=="h3_features"
+    assert body["meta"]["source"]=="entity_part_h3"
     assert len(body["rows"])<=10
     for row in body["rows"]:
         assert row["h3_index"]

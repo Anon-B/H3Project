@@ -1,55 +1,89 @@
 # API Reference
 
 Base URL: `http://localhost:8000`
+FastAPI Swagger: `/docs`. Responses use ORJSON; GZip is enabled for responses >= 1000 bytes.
 
-## GET /ingestion/dataset/h3
-Parameters: `dataset`, `resolution=5..15`.
-Returns H3 cell IDs for Map rendering. The response does not contain Polygon coordinates or GeoJSON geometry. `entity_h3` provides one H3 anchor per entity so the frontend can derive an entity marker position with `h3-js`.
+## Public health
+### GET /health
+Returns database status, entity count and Redis availability.
+### GET /ready
+Returns ready/degraded. Redis degradation does not make the API itself unavailable.
+### GET /metrics
+Returns database, user-table, user-index byte sizes and Redis status.
 
-Example:
-```bash
-curl 'http://localhost:8000/ingestion/dataset/h3?dataset=api-test&resolution=11'
-```
+## Dataset catalog
+### GET /ingestion/datasets
+Query: `limit=1..500`. Returns dataset registry + entity/part/Boundary-H3 counts.
+### GET /datasets/{dataset_id}
+Returns one dataset with metadata/catalog and counts.
+### PATCH /datasets/{dataset_id}
+Accepts name, metadata, source, owner, version, source_format, geographic_coverage, tags, license, update_frequency, schema, lineage and h3_resolution.
+Frontend intentionally locks resolution during normal edit.
+### DELETE /datasets/{dataset_id}
+Deletes dataset and cascaded canonical data; current implementation flushes Redis if available.
 
-## GET /analytics/h3
-`dataset`, `resolution=5..15`, `limit`
-Returns one aggregated row per H3 cell from the `h3_features` analytics layer. Includes entity count, feature count, coverage values and centroid-cell flag.
+## GeoJSON ingestion
+### POST /ingestion/geojson/preview
+Body: GeoJSON FeatureCollection, Feature, or supported Geometry.
+Query: `resolution=5..15`. No DB write.
+Returns feature count, boundary cell counts, display cell counts and per-feature preview.
+Preview limit: 10,000 features; generated preview is capped to protect memory/output.
 
-Example:
-```bash
-curl 'http://localhost:8000/analytics/h3?dataset=api-test&resolution=11&limit=10'
-```
+### POST /ingestion/geojson/execute
+Body: same GeoJSON. Query: `resolution=5..15`, optional `dataset=<name>`.
+Writes dataset/entities/parts/attributes/Boundary-H3 and ingestion audit rows in one transaction.
+If dataset name exists, the current implementation reuses it.
 
-## GET /summary
-`res=5|8`, `cache=true|false`  
-Returns H3 summary polygons as GeoJSON. `source` tells whether Redis or DB supplied the data. Cache TTL is 300 seconds.
+## Entity inspection
+### GET /entities/{entity_id}
+Returns entity parts and canonical Boundary H3 grouped by part/ring.
+### GET /entities/{entity_id}/coverage
+Query: optional resolution. Returns reconstructed H3 GeoJSON for display/inspection.
 
-Example:
-```bash
-curl 'http://localhost:8000/summary?res=8'
-```
+## Dataset display
+### POST /ingestion/dataset/preview
+Body: {dataset, resolution, limit}. Returns reconstructed H3 FeatureCollection.
+This is a server-side preview endpoint; normal Map loading uses the H3-ID endpoint below.
 
-## GET /nearby
-Required: `lat`, `lng`. Optional: `radius_m` (1–50000), `limit` (1–5000), `active_only`, `mode=h3|db`.
+### GET /ingestion/dataset/h3
+Required: `dataset`; optional `resolution=5..15`.
+Returns source_resolution, boundary_h3, boundary_parts and entity_h3.
+It does NOT return polygon geometry for every display cell.
+Frontend reconstructs display cells from boundary_parts.
 
-`mode=h3` = H3 candidate selection + exact PostGIS. `mode=db` = exact PostGIS without H3, intended for benchmark comparison.
+## Analytics
+### GET /analytics/h3
+Query: optional dataset; resolution 5..15; limit 1..200000.
+Returns grouped h3_index, entity_count and feature_count from entity_part_h3.
+Coverage values are currently null in this API response.
 
-Example:
-```bash
-curl 'http://localhost:8000/nearby?lat=13.7563&lng=100.5018&radius_m=1000&limit=500'
-```
+### POST /query
+Advanced attribute/spatial query. Body supports dataset, conditions, spatial and limit.
+Condition fields currently include entity_id, properties.<key>, attribute, h3_index and resolution.
+Spatial types currently include bbox and polygon.
 
-## GET /bbox
-Parameters: `min_lat,min_lng,max_lat,max_lng`, plus `limit` and `active_only`.
-Returns Point GeoJSON. H3 Res8 narrows candidates before the spatial envelope predicate.
+## Legacy/general spatial APIs
+### GET /summary
+Query: res=5..15, optional dataset.
+Returns H3 polygons as GeoJSON and may use Redis cache with 300s TTL.
 
-Example:
-```bash
-curl 'http://localhost:8000/bbox?min_lat=13.70&min_lng=100.45&max_lat=13.80&max_lng=100.55'
-```
+### GET /nearby
+Required lat/lng. radius_m 0..50000, limit 1..5000, optional dataset.
+Current code executes exact PostGIS distance against entity_point. Do not document this as an H3 broad-phase path unless the implementation is changed.
 
-## GET /health /ready /metrics
-Health checks DB and Redis; readiness reports degraded when Redis is unavailable; metrics returns DB/table/index sizes.
+### GET /bbox
+Required min_lat,min_lng,max_lat,max_lng; limit 1..20000; optional dataset.
+Current code filters entity_point coordinates directly.
+
+## Ingestion history
+### POST /ingestion/dataset/execute
+Compatibility endpoint. Current implementation is effectively a no-op and returns status/reason; use GeoJSON execute for canonical ingestion.
+### GET /ingestion/runs
+Returns recent ingestion runs; limit 1..100.
+### GET /ingestion/runs/{run_id}
+Returns run metadata and H3 storage statistics.
 
 ## Authentication
-Set `API_KEY` in the environment. Then send `X-API-Key: <value>` to protected endpoints. `/health` and `/ready` remain public for container health checks.
+Set `API_KEY` in the API environment. All endpoints except /health and /ready then require `X-API-Key`.
+POC CORS is currently allow-all and should be restricted before production.
+

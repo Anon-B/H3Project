@@ -1,98 +1,60 @@
-# H3Project — คู่มือใช้งาน
+# H3Project — User Guide
 
-## 1. ภาพรวม
-POC นี้เป็น Spatial Data Platform สำหรับข้อมูลจุดจำนวนมาก โดยใช้ H3 เป็น broad-phase candidate index และ PostGIS เป็น exact spatial filter
-
-Flow หลัก:
-Raw CSV → H3 Res11/8/5 → PostgreSQL/PostGIS → Gold Summary → Redis → FastAPI → GeoJSON → MapLibre
-
-## 2. เริ่มระบบ
+## Start
 ```bash
 cd /Users/anonpond/H3Project
 colima start --cpu 10 --memory 20 --disk 80
 docker-compose up -d --build
 ```
-ตรวจสอบ:
-```bash
-docker-compose ps
-curl http://localhost:8000/health
-curl http://localhost:8000/ready
+Open http://localhost:8080.
+
+## Overview
+Shows workspace KPIs and recent datasets. Click a recent dataset to open it on Map.
+
+## Datasets
+Use Datasets to search the registry, open detail, edit metadata/catalog, view on Map or delete.
+Core H3 resolution is locked in normal edit because changing it requires rebuilding coverage.
+
+## Ingestion
+1. Open Ingestion.
+2. Choose File/GeoJSON or Draw.
+3. Enter dataset name.
+4. Choose source H3 resolution.
+5. Review attributes/JSON.
+6. Preview H3.
+7. Execute.
+8. Open Dataset Registry.
+
+## Map
+Choose dataset, then choose H3 Display Resolution.
+Res 5 = coarse city/province view; Res 8 = neighborhood; Res 11 = fine detail.
+Entities and H3 Cells can be toggled independently.
+
+## Analysis
+Analysis follows the active dataset and display resolution.
+Available metric: No metric / Entity count.
+
+## Style & 3D
+Choose color preset or custom colors.
+Adjust opacity, enable 3D Extrusion and adjust Height.
+Settings persist in browser localStorage.
+
+## Query
+Map Query supports attribute/entity/H3/resolution conditions and current spatial options.
+Results appear in the Inspector as JSON.
+
+## Inspector
+Click a cell/entity to inspect its JSON. Copy JSON from the Inspector.
+The Inspector intentionally does not render a separate attribute table.
+
+## Basemap
+Use Basemap panel to switch map style without rebuilding data.
+
+## Settings
+Contains map defaults, runtime information and architecture note.
+
+## Common flow
+```text
+Ingestion -> Dataset -> Map -> Analysis/Query -> Inspector
 ```
 
-## 3. หน้าใช้งาน
-- Map: http://localhost:8080
-- Swagger: http://localhost:8000/docs
-- Health: http://localhost:8000/health
-- Metrics: http://localhost:8000/metrics
-
-## 4. Data pipeline
-สร้างข้อมูล:
-```bash
-docker-compose run --rm api python scripts/generate_data.py --rows 1000000 --output data/entities.csv
-```
-โหลดข้อมูลและสร้าง geometry/index:
-```bash
-docker-compose run --rm api python scripts/load_data.py
-docker-compose exec -T db psql -U h3 -d h3project -f /app/sql/schema.sql
-```
-สร้าง Gold summary:
-```bash
-docker-compose run --rm api python scripts/refresh_summary.py
-docker-compose run --rm api python scripts/refresh_summary_res8.py
-```
-Warm/clear Redis:
-```bash
-docker-compose run --rm api python scripts/warm_redis.py
-docker-compose run --rm api python scripts/invalidate_cache.py
-```
-
-## 5. API
-`GET /health` ตรวจ DB + จำนวน entity + Redis
-`GET /ready` readiness ของระบบ; Redis ล่มจะรายงาน degraded
-`GET /metrics` ขนาด DB/table/index และสถานะ Redis
-`GET /summary?res=5|8&cache=true` คืน H3 Polygon summary เป็น GeoJSON
-`GET /nearby?lat=&lng=&radius_m=&limit=&active_only=&mode=h3|db` ค้นหาจุดใกล้เคียง
-`GET /bbox?min_lat=&min_lng=&max_lat=&max_lng=&limit=&active_only=` ค้นหาจุดในกรอบแผนที่
-
-## 6. ความหมายของฟังก์ชัน
-- `generate_data.py`: สร้าง synthetic lat/lng และ H3 3 ระดับ
-- `load_data.py`: bulk load CSV และ populate geometry
-- `incremental_upsert.py`: upsert ตาม id เหมาะกับ incremental batch และ soft delete
-- `refresh_summary*.py`: สร้าง Gold aggregate Res5/Res8
-- `warm_redis.py`: เติม cache summary
-- `invalidate_cache.py`: ลบ cache เพื่อบังคับอ่าน DB ใหม่
-- `data_quality.py`: ตรวจ range, geometry, H3, duplicate ID และ parent relationship
-- `correctness.py`: เปรียบเทียบผล API กับ ST_DWithin
-- `boundary_tests.py`: ทดสอบ boundary/cross-cell/empty/dense/large/small radius
-- `benchmark_api.py`: P50/P95/P99/payload ของ endpoint
-- `concurrency.py`: ทดสอบ 10/50/100 concurrent
-- `matrix.py`: เปรียบเทียบ DB-only, H3+DB, Redis summary
-
-## 7. หลักการ spatial query
-1. แปลงจุดค้นหาเป็น H3 Res11
-2. สร้าง candidate cells ด้วย grid disk
-3. ใช้ H3 index ลดจำนวน candidate
-4. ใช้ PostGIS `ST_DWithin` ตรวจระยะจริง
-5. คืนผลเป็น GeoJSON
-
-ดังนั้น H3 ไม่ได้แทน exact spatial predicate และไม่ควรใช้ H3 เพียงอย่างเดียวในการตัดสินระยะทาง
-
-## 8. Web Ingestion Pipeline — GeoJSON
-รายละเอียดเต็มอยู่ที่ `docs/INGESTION_GEOJSON.md`.
-เปิด `http://localhost:8080` → Ingestion → เลือก/วาง GeoJSON → Preview H3 → เลือก Res11/Res8/Res5 → Run Pipeline หรือ Download H3 GeoJSON.
-
-## 9. Map — Basemap
-หน้า Map มีตัวเลือก **Basemap** สำหรับเปลี่ยนพื้นหลังแผนที่ โดยใช้ style จาก Make with MapLibre
-
-ตัวเลือกที่มี:
-- Liberty — OpenFreeMap
-- Bright — OpenFreeMap
-- Positron — OpenFreeMap
-- Dark — OpenFreeMap
-- Fiord — OpenFreeMap
-- Colorful — VersaTiles
-
-เลือกจากช่อง **Basemap** ด้านบนของแผง Map ได้ทันที โดยไม่ต้อง reload หน้าเว็บ ข้อมูล H3 / GeoJSON / Map Query ที่แสดงอยู่จะถูกสร้างกลับหลังเปลี่ยน style
-
-แหล่งรวม Basemap:
-https://makewithmaplibre.com/basemaps/

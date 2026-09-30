@@ -13,7 +13,7 @@ DB=os.getenv("DATABASE_URL","postgresql://h3:h3@db:5432/h3project")
 REDIS=os.getenv("REDIS_URL","redis://redis:6379/0")
 API_KEY=os.getenv("API_KEY","")
 GEOD=Geod(ellps="WGS84")
-app=FastAPI(title="H3Project API",version="0.7.0",default_response_class=ORJSONResponse)
+app=FastAPI(title="H3Project API",version="1.1.0",default_response_class=ORJSONResponse)
 rdb=redis.Redis.from_url(REDIS,decode_responses=True)
 pool=ConnectionPool(DB,min_size=2,max_size=20,open=True)
 
@@ -344,7 +344,7 @@ def _insert_feature(cur,entity_id,dataset_id,feature,res,run_id=None):
                        entity_id,part_index,part_type,min_lat,min_lng,max_lat,max_lng,properties,metadata)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING part_id""",
                     (entity_id,part["part_index"],part["part_type"],
-                     *(bb or (None,None,None,None)),json.dumps(props),
+                     *(bb or (None,None,None,None)),json.dumps({}),
                      json.dumps({"boundary_only":part["part_type"]=="polygon",
                                  "source_geometry":geom.get("type"),"resolution":res})))
         part_id=cur.fetchone()[0]
@@ -361,15 +361,6 @@ def _insert_feature(cur,entity_id,dataset_id,feature,res,run_id=None):
             cur.execute("""INSERT INTO entity_point(entity_id,latitude,longitude)
                            VALUES (%s,%s,%s) ON CONFLICT(entity_id) DO NOTHING""",
                         (entity_id,float(p[1]),float(p[0])))
-        analytics=_analytics_for_part(part,res)
-        for cell,cell_cov,poly_cov,is_centroid,pixel_cov in analytics:
-            cur.execute("""INSERT INTO h3_features(
-                           dataset_id,entity_id,part_id,resolution,h3_index,feature_type,
-                           cell_coverage,polygon_coverage,centroid_cell,pixel_coverage,properties)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                           ON CONFLICT DO NOTHING""",
-                        (dataset_id,entity_id,part_id,res,cell,part["part_type"],cell_cov,poly_cov,
-                         is_centroid,pixel_cov,json.dumps(props)))
         for ring_id,ring_type,cell in part["cells"]:
             cur.execute("""INSERT INTO entity_part_h3(
                            part_id,resolution,ring_id,ring_type,h3_index)
@@ -407,6 +398,10 @@ def _execute_ingestion(payload,res,dataset_name=None):
             for i,f in enumerate(features):
                 f=dict(f);f["_index"]=i;eid=_next_entity_id(cur)
                 cur.execute("INSERT INTO entities(entity_id,dataset_id) VALUES (%s,%s)",(eid,dataset_id))
+                cur.execute("""INSERT INTO entity_attributes(entity_id,properties)
+                               VALUES (%s,%s)
+                               ON CONFLICT(entity_id) DO UPDATE SET properties=EXCLUDED.properties""",
+                            (eid,json.dumps(f.get("properties") or {})))
                 _insert_feature(cur,eid,dataset_id,f,res,run_id)
             cur.execute("UPDATE ingestion_runs SET status='completed' WHERE id=%s",(run_id,));c.commit()
     if redis_ok():rdb.flushdb()
@@ -425,9 +420,11 @@ def ingestion_execute(payload:dict=Body(...),resolution:int=Query(11,ge=5,le=15)
     return _execute_ingestion(payload,resolution,dataset)
 
 def _entity_parts(entity_id,res=None):
-    sql="""SELECT p.part_id,p.part_index,p.part_type,p.min_lat,p.min_lng,p.max_lat,p.max_lng,p.properties,
+    sql="""SELECT p.part_id,p.part_index,p.part_type,p.min_lat,p.min_lng,p.max_lat,p.max_lng,a.properties,
                   h.ring_id,h.ring_type,h.h3_index,h.resolution
-           FROM entity_parts p LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id
+           FROM entity_parts p
+           LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id
+           LEFT JOIN entity_attributes a ON a.entity_id=p.entity_id
            WHERE p.entity_id=%s"""
     params=[entity_id]
     if res is not None:sql+=" AND (h.resolution=%s OR h.resolution IS NULL)";params.append(res)
@@ -467,11 +464,12 @@ def entity_coverage(entity_id:int,resolution:int|None=None):
 
 def _dataset_rows(name,limit=10000,res=None):
     sql="""SELECT e.entity_id,d.name,d.data_type,d.h3_resolution,p.part_id,p.part_index,p.part_type,
-                  p.min_lat,p.min_lng,p.max_lat,p.max_lng,p.properties,
+                  p.min_lat,p.min_lng,p.max_lat,p.max_lng,a.properties,
                   h.ring_id,h.ring_type,h.h3_index,h.resolution
            FROM entities e JOIN datasets d ON d.dataset_id=e.dataset_id
            JOIN entity_parts p ON p.entity_id=e.entity_id
            LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id
+           LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
            WHERE d.name=%s"""
     params=[name]
     if res is not None:sql+=" AND (h.resolution=%s OR h.resolution IS NULL)";params.append(res)
@@ -505,25 +503,53 @@ def ingestion_dataset_preview(body:dict=Body(...)):
 def ingestion_dataset_h3(dataset:str, resolution:int=Query(11,ge=5,le=15)):
     name=dataset.strip()
     if not name:raise HTTPException(400,"dataset is required")
-    rows=_dataset_rows(name,0,resolution)
-    if not rows:raise HTTPException(404,"dataset not found or empty")
-    by_entity={}
-    all_cells=set()
-    for x in rows:
-        parts=by_entity.setdefault(x[0],{})
-        part=parts.setdefault(x[5],{"part_type":x[6],"res":x[15] or resolution,"rows":[]})
-        if x[14]:part["rows"].append((x[12],x[13],x[14]))
-    for parts in by_entity.values():
-        for part in parts.values():all_cells.update(_display_cells_for_part_rows(part["rows"],part["res"]))
-    entity_h3=[]
+
+    # Core storage is Boundary H3. The frontend reconstructs/fills display
+    # cells from these boundary cells at the requested display resolution.
     with db_conn() as c:
         with c.cursor() as cur:
-            cur.execute("""SELECT DISTINCT ON (h.entity_id) h.entity_id,h.h3_index
-                           FROM h3_features h JOIN datasets d ON d.dataset_id=h.dataset_id
-                           WHERE d.name=%s AND h.resolution=%s
-                           ORDER BY h.entity_id,h.centroid_cell DESC,h.h3_index""",(name,resolution))
-            entity_h3=[{"entity_id":x[0],"h3_index":x[1]} for x in cur.fetchall()]
-    return {"dataset":name,"resolution":resolution,"h3":sorted(all_cells),"entity_h3":entity_h3}
+            cur.execute("""SELECT DISTINCT h.resolution,h.h3_index
+                           FROM entity_part_h3 h
+                           JOIN entity_parts p ON p.part_id=h.part_id
+                           JOIN entities e ON e.entity_id=p.entity_id
+                           JOIN datasets d ON d.dataset_id=e.dataset_id
+                           WHERE d.name=%s
+                           ORDER BY h.h3_index""",(name,))
+            boundary_rows=cur.fetchall()
+            cur.execute("""SELECT e.entity_id,p.part_index,h.ring_id,h.ring_type,h.h3_index,h.resolution
+                           FROM entities e
+                           JOIN datasets d ON d.dataset_id=e.dataset_id
+                           JOIN entity_parts p ON p.entity_id=e.entity_id
+                           JOIN entity_part_h3 h ON h.part_id=p.part_id
+                           WHERE d.name=%s
+                           ORDER BY e.entity_id,p.part_index,h.ring_id,h.h3_index""",(name,))
+            part_rows=cur.fetchall()
+            cur.execute("""SELECT DISTINCT ON (e.entity_id)
+                                  e.entity_id,h.h3_index,a.properties
+                           FROM entities e
+                           JOIN datasets d ON d.dataset_id=e.dataset_id
+                           JOIN entity_parts p ON p.entity_id=e.entity_id AND p.part_index=0
+                           LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id
+                           LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
+                           WHERE d.name=%s AND h.resolution=d.h3_resolution
+                           ORDER BY e.entity_id,h.h3_index""",(name,))
+            entity_rows=cur.fetchall()
+    if not boundary_rows:raise HTTPException(404,"dataset not found or empty")
+
+    source_res=int(boundary_rows[0][0])
+    boundary_cells={x[1] for x in boundary_rows if x[1]}
+    parts={}
+    for eid,part_index,ring_id,ring_type,cell,res in part_rows:
+        key=(eid,part_index)
+        part=parts.setdefault(key,{"entity_id":eid,"part_index":part_index,"resolution":res,
+                                   "rings":{}})
+        part["rings"].setdefault(ring_id,{"ring_id":ring_id,"ring_type":ring_type,"h3":[]})["h3"].append(cell)
+    boundary_parts=list(parts.values())
+    entity_h3=[{"entity_id":x[0],"h3_index":x[1],"properties":x[2] or {}} for x in entity_rows if x[1]]
+    return {"dataset":name,"resolution":resolution,"source_resolution":source_res,
+            "h3":sorted(boundary_cells),"boundary_h3":sorted(boundary_cells),
+            "boundary_parts":boundary_parts,"entity_h3":entity_h3,
+            "display_mode":"frontend_boundary_fill"}
 
 @app.post("/query")
 def advanced_query(body:dict=Body(...)):
@@ -539,11 +565,11 @@ def advanced_query(body:dict=Body(...)):
         elif field.startswith("properties."):
             key=field.split(".",1)[1]
             if op not in {"=","!=","contains"}:raise HTTPException(400,"unsupported attribute operator")
-            if op=="contains":where.append("p.properties->>%s ILIKE %s");params.extend([key,"%"+str(value)+"%"])
-            else:where.append("(p.properties->>%s) "+op+" %s");params.extend([key,str(value)])
+            if op=="contains":where.append("a.properties->>%s ILIKE %s");params.extend([key,"%"+str(value)+"%"])
+            else:where.append("(a.properties->>%s) "+op+" %s");params.extend([key,str(value)])
         elif field=="attribute":
             if not isinstance(value,dict):raise HTTPException(400,"attribute filter value must be JSON object")
-            where.append("p.properties @> %s::jsonb");params.append(json.dumps(value))
+            where.append("a.properties @> %s::jsonb");params.append(json.dumps(value))
         elif field=="h3_index":
             if op not in {"=","!="}:raise HTTPException(400,"unsupported h3_index operator")
             where.append("h.h3_index "+op+" %s");params.append(value)
@@ -565,11 +591,12 @@ def advanced_query(body:dict=Body(...)):
                        float(spatial.get("max_lng",180)),float(spatial.get("min_lng",-180))]
     if not where:where.append("TRUE")
     sql="""SELECT DISTINCT e.entity_id,d.name,d.data_type,d.h3_resolution,p.part_id,p.part_index,p.part_type,
-                  p.min_lat,p.min_lng,p.max_lat,p.max_lng,p.properties
+                  p.min_lat,p.min_lng,p.max_lat,p.max_lng,a.properties
            FROM entities e JOIN datasets d ON d.dataset_id=e.dataset_id
            JOIN entity_parts p ON p.entity_id=e.entity_id
            LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id
-           WHERE """+" AND ".join(where)+""" ORDER BY e.entity_id,p.part_index LIMIT %s"""
+           LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
+           WHERE """+" AND ".join(where)+" ORDER BY e.entity_id,p.part_index LIMIT %s"
     params.append(limit)
     with db_conn() as c:
         with c.cursor() as cur:cur.execute(sql,params);rows=cur.fetchall()
@@ -584,23 +611,24 @@ def advanced_query(body:dict=Body(...)):
 @app.get("/analytics/h3")
 def h3_analytics(dataset:str|None=None,resolution:int=Query(11,ge=5,le=15),limit:int=Query(50000,ge=1,le=200000)):
     sql="""SELECT h.h3_index,
-                  count(DISTINCT h.entity_id) AS entity_count,
-                  count(*) AS feature_count,
-                  avg(h.cell_coverage) AS avg_cell_coverage,
-                  max(h.polygon_coverage) AS polygon_coverage,
-                  bool_or(h.centroid_cell) AS centroid_cell
-           FROM h3_features h
+                  count(DISTINCT e.entity_id) AS entity_count,
+                  count(*) AS feature_count
+           FROM entity_part_h3 h
+           JOIN entity_parts p ON p.part_id=h.part_id
+           JOIN entities e ON e.entity_id=p.entity_id
+           JOIN datasets d ON d.dataset_id=e.dataset_id
            WHERE h.resolution=%s"""
     params=[resolution]
     if dataset:
-        sql+=" AND EXISTS (SELECT 1 FROM datasets d WHERE d.dataset_id=h.dataset_id AND d.name=%s)"
+        sql+=" AND d.name=%s"
         params.append(dataset)
-    sql+=" GROUP BY h.h3_index ORDER BY entity_count DESC,h.h3_index LIMIT %s";params.append(limit)
+    sql+=" GROUP BY h.h3_index ORDER BY entity_count DESC,h.h3_index LIMIT %s"
+    params.append(limit)
     with db_conn() as c:
         with c.cursor() as cur:cur.execute(sql,params);rows=cur.fetchall()
     return {"rows":[{"h3_index":x[0],"entity_count":x[1],"feature_count":x[2],
-                     "avg_cell_coverage":x[3],"polygon_coverage":x[4],"centroid_cell":bool(x[5])} for x in rows],
-            "meta":{"dataset":dataset,"resolution":resolution,"count":len(rows),"source":"h3_features"}}
+                     "avg_cell_coverage":None,"polygon_coverage":None,"centroid_cell":False} for x in rows],
+            "meta":{"dataset":dataset,"resolution":resolution,"count":len(rows),"source":"entity_part_h3"}}
 
 @app.get("/summary")
 def summary(res:int=Query(5,ge=5,le=15),dataset:str|None=None):
@@ -626,9 +654,9 @@ def nearby(lat:float,lng:float,radius_m:float=Query(1000,gt=0,le=50000),limit:in
     clauses=["ST_DWithin(ST_SetSRID(ST_MakePoint(p.longitude,p.latitude),4326)::geography,ST_SetSRID(ST_MakePoint(%s,%s),4326)::geography,%s)"]
     params=[lng,lat,radius_m]
     if dataset:clauses.append("d.name=%s");params.append(dataset)
-    sql="""SELECT e.entity_id,d.name,p.latitude,p.longitude,ep.properties
+    sql="""SELECT e.entity_id,d.name,p.latitude,p.longitude,a.properties
            FROM entity_point p JOIN entities e ON e.entity_id=p.entity_id JOIN datasets d ON d.dataset_id=e.dataset_id
-           LEFT JOIN entity_parts ep ON ep.entity_id=e.entity_id AND ep.part_index=0
+           LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
            WHERE """+" AND ".join(clauses)+""" ORDER BY ST_Distance(ST_SetSRID(ST_MakePoint(p.longitude,p.latitude),4326)::geography,
            ST_SetSRID(ST_MakePoint(%s,%s),4326)::geography) LIMIT %s"""
     params += [lng,lat,limit]
@@ -643,9 +671,9 @@ def bbox(min_lat:float,min_lng:float,max_lat:float,max_lng:float,limit:int=Query
     clauses=["p.latitude BETWEEN %s AND %s","p.longitude BETWEEN %s AND %s"];params=[min_lat,max_lat,min_lng,max_lng]
     if dataset:clauses.append("d.name=%s");params.append(dataset)
     params.append(limit)
-    sql="""SELECT e.entity_id,d.name,p.latitude,p.longitude,ep.properties
+    sql="""SELECT e.entity_id,d.name,p.latitude,p.longitude,a.properties
            FROM entity_point p JOIN entities e ON e.entity_id=p.entity_id JOIN datasets d ON d.dataset_id=e.dataset_id
-           LEFT JOIN entity_parts ep ON ep.entity_id=e.entity_id AND ep.part_index=0
+           LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
            WHERE """+" AND ".join(clauses)+""" LIMIT %s"""
     with db_conn() as c:
         with c.cursor() as cur:cur.execute(sql,params);rows=cur.fetchall()

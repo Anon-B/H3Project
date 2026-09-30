@@ -1,101 +1,61 @@
 # Data Model
 
-## Design goal
+## Canonical model
+The current application model is dataset -> entity -> entity_part -> entity_part_h3, with entity_attributes for source properties.
 
-The database is a lightweight entity registry with Boundary H3 as the canonical polygon representation.
+## datasets
+Dataset registry and configuration.
+Important fields: dataset_id, name, data_type, h3_resolution, metadata, source, owner, version, source_format, geographic_coverage, tags, license, update_frequency, schema_definition, lineage.
 
-- Original Polygon/MultiPolygon geometry is not stored.
-- Polygon storage keeps only boundary H3 cells.
-- Polygon holes are stored as separate H3 rings.
-- MultiPolygon parts stay grouped under one entity when they come from one GeoJSON Feature.
-- Polygon attributes are stored per part as JSONB.
-- Line uses H3 coverage along the line.
-- Point keeps exact latitude/longitude plus H3.
-- Dataset controls one canonical H3 resolution.
+## entities
+Minimal entity registry: entity_id + dataset_id.
 
-## Tables
+## entity_attributes
+One row per entity. Source properties are stored as JSONB in `properties`.
+Use this table for Entity-level attributes; do not duplicate source properties into new H3 display tables.
 
-### datasets
+## entity_parts
+One spatial part per entity.
+part_type = point | line | polygon.
+Stores part index, bbox, reserved properties JSONB and reconstruction metadata.
 
-Dataset definition and H3 configuration.
+## entity_point
+Exact latitude/longitude for Point entities.
 
-Fields: dataset_id, name, data_type, h3_resolution, metadata, timestamps.
-
-### entities
-
-Minimal entity registry.
-
-Fields: entity_id, dataset_id.
-
-### entity_parts
-
-One spatial part of an entity. MultiPolygon uses multiple polygon parts.
-
-Fields: part_id, entity_id, part_index, part_type, bbox, properties JSONB, metadata.
-
-### entity_part_h3
-
+## entity_part_h3
 Canonical H3 storage.
+Primary key: part_id + resolution + ring_id + h3_index.
+ring_type = none | outer | hole | line.
+Polygon rows are boundary cells only.
 
-Fields: part_id, resolution, ring_id, ring_type, h3_index.
+## entity_h3
+Compatibility view joining entity_part_h3 to entity_parts and exposing entity_id, resolution and h3_index.
 
-Polygon ring_type: outer or hole. Line: line. Point: none.
+## ingestion history
+ingestion_runs = one pipeline execution.
+ingestion_parts = source feature/part mapping for that run.
+ingestion_h3_cells = generated H3 audit rows for that run.
 
-### entity_point
-
-Exact point coordinates for point entities.
-
-### raster_datasets
-
-Raster metadata and external file URI only.
-
-### ingestion_runs / ingestion_parts / ingestion_h3_cells
-
-Pipeline history and generated boundary/line H3 output. These are separate from canonical entity storage.
+## raster_datasets
+Metadata and external file URI for future raster ingestion. Raster processing is not the primary current web ingestion path.
 
 ## Display model
+```text
+Boundary H3 + ring metadata
+        -> frontend reconstruction
+        -> display H3 cells
+        -> GPU rendering
+```
 
-Database stores:
+## Storage rules
+1. Do not add h3_features.
+2. Do not persist every display cell as canonical data.
+3. Keep source attributes in entity_attributes.
+4. Keep polygon ring semantics in entity_part_h3.
+5. If changing canonical storage, update schema, API, ingestion, frontend and migration docs together.
 
-Boundary H3 -> ring metadata -> part attributes
+## Schema lifecycle
+`sql/schema.sql` is the current complete schema definition.
+`sql/migrations/002_h3_analytics_catalog.sql` contains migration history for the analytics/catalog transition.
+For a fresh DB, load schema.sql. For an existing DB, apply migrations deliberately and verify the resulting schema.
 
-API display reconstructs:
-
-Boundary H3 -> approximate ring -> H3 fill -> hole subtraction -> Map cells
-
-Therefore the database stays small while the Map still shows interior H3 cells.
-
-## Query strategy
-
-Attribute: JSONB GIN index on entity_parts.properties.
-
-BBox: part bbox candidates.
-
-Polygon: boundary H3 candidates plus bbox candidates; exact original geometry intersection is intentionally unavailable.
-
-Nearby: exact point distance for entity_point.
-
-Line: H3 coverage lookup.
-
-## H3 Analytics layer
-
-`h3_features` is a derived analytics table. It does not replace `entity_part_h3`.
-
-- `entity_part_h3` = canonical Boundary H3 storage for compact spatial representation.
-- `h3_features` = analytics-oriented H3 rows for counting, coverage and map metrics.
-- Polygon rows can store `cell_coverage` (fraction of cell covered) and `polygon_coverage` (fraction of part area covered).
-- `centroid_cell` marks the H3 cell containing the part centroid.
-- `pixel_coverage` is reserved for raster-derived coverage and is nullable for vector data.
-- Original geometry is still not persisted.
-
-## Dataset Catalog
-
-`datasets` now also supports source, owner, version, source format, geographic coverage, tags, license, update frequency, schema and lineage.
-
-## Compatibility
-
-entity_h3 is exposed as a view over entity_part_h3 so simple H3 lookup code can continue to work.
-
-## Storage principle
-
-Do not store full polygon coverage as the canonical data. Store boundary H3 only and reconstruct display coverage when required.

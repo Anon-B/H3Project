@@ -1,7 +1,7 @@
 {
   "name": "h3-data-platform-frontend",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
@@ -15,6 +15,10 @@
     "@deck.gl/mapbox": "^9.2.0",
     "@deck.gl/maplibre": "^9.4.0",
     "@deck.gl/react": "^9.2.0",
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@mui/icons-material": "^9.4.0",
+    "@mui/material": "^9.4.0",
     "h3-js": "^4.1.0",
     "maplibre-gl": "^5.16.0",
     "maplibre-gl-draw": "^1.6.9",

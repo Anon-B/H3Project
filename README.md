@@ -1,51 +1,38 @@
 # H3Project
 
-Spatial Data Platform POC: H3 + PostgreSQL/PostGIS + Redis + FastAPI + MapLibre.
+**Release: v1.1.0**
+
+Spatial Data Platform POC สำหรับ ingest และสำรวจข้อมูลเชิงพื้นที่ด้วย H3 + PostgreSQL/PostGIS + Redis + FastAPI + MapLibre + deck.gl
+
+## อ่านเอกสารก่อนเริ่ม
+1. `docs/DOCUMENTATION_INDEX.md` — จุดเริ่มต้นและแผนผังเอกสาร
+2. `docs/PROJECT_OVERVIEW.md` — ภาพรวมระบบและสิ่งที่คนมารับช่วงต้องรู้
+3. `docs/ARCHITECTURE.md` — architecture และ data flow
+4. `docs/DATA_MODEL.md` — canonical data model
+5. `docs/API_REFERENCE.md` — API ปัจจุบัน
+6. `docs/DEVELOPER_GUIDE.md` — วิธีพัฒนา/build/test
+7. `docs/USER_GUIDE.md` — วิธีใช้งานเว็บ
+8. `docs/TROUBLESHOOTING.md` — ปัญหาที่พบบ่อย
+
+## Current runtime
+- Map: http://localhost:8080
+- API: http://localhost:8000
+- Swagger: http://localhost:8000/docs
+- Health: http://localhost:8000/health
+- Readiness: http://localhost:8000/ready
+- Metrics: http://localhost:8000/metrics
+- Release: `v1.1.0`
+- Branch: `feature/ingestion`
 
 ## Start
 ```bash
 cd /Users/anonpond/H3Project
 colima start --cpu 10 --memory 20 --disk 80
 docker-compose up -d --build
+docker-compose ps
+curl http://localhost:8000/health
 ```
 
-## URLs
-- Map: http://localhost:8080
-- Swagger: http://localhost:8000/docs
-- Health: http://localhost:8000/health
-- Readiness: http://localhost:8000/ready
-- Metrics: http://localhost:8000/metrics
-
-## Data
-Current validated POC dataset: 10,000,000 synthetic points.
-```bash
-docker-compose run --rm api python scripts/generate_data.py --rows 1000000 --output data/entities.csv
-docker-compose run --rm api python scripts/load_data.py
-docker-compose run --rm api python scripts/refresh_summary.py
-docker-compose run --rm api python scripts/refresh_summary_res8.py
-docker-compose run --rm api python scripts/warm_redis.py
-```
-
-## Verification
-```bash
-docker-compose exec -T api pytest -q
-docker-compose exec -T api python scripts/data_quality.py
-docker-compose exec -T api python scripts/correctness.py
-docker-compose exec -T api python scripts/boundary_tests.py
-```
-
-## Benchmark
-```bash
-python3 benchmarks/benchmark_api.py
-python3 benchmarks/concurrency.py
-python3 benchmarks/matrix.py
-```
-Results are machine-specific; see `benchmarks/results/`.
-
-## Docs
-- `docs/USER_GUIDE.md` — usage and function guide
-- `docs/DATA_DICTIONARY.md` — fields and governance rules
-- `docs/OPERATIONS.md` — reliability, backup, security, observability
-- `docs/ARCHITECTURE.md` — system design
-- `IMPLEMENTATION_PLAN.md` — checklist/audit
-- `docs/API_REFERENCE.md` — API parameters and examples
+## Core rule
+Boundary H3 ใน `entity_part_h3` คือ canonical spatial storage. ห้ามนำ `h3_features` กลับมาใช้.
+Frontend รับ H3 IDs จาก API แล้ว reconstruct/fill display cells ด้วย h3-js; API ไม่ต้องส่ง polygon ของทุก display cell.

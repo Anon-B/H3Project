@@ -1,30 +1,45 @@
-# Operations / Production Checklist
+# Operations
 
-## Reliability
-- Redis is optional: `/health` remains usable when Redis is unavailable and `/ready` reports `degraded`.
-- Empty cache is a normal cache miss; API rebuilds it from Gold.
-- Duplicate ingestion is handled by `incremental_upsert.py` using `ON CONFLICT(id) DO UPDATE`.
-- Failed batches are transactional per batch; rerun is safe for the same IDs.
-- API has DB connection pooling (2–20 connections), 30s client benchmark timeout, and container health checks.
+## Runtime
+Services: db, redis, api, frontend.
+Ports: PostgreSQL 5432, Redis 6379, API 8000, frontend 8080.
+Local runtime uses Colima with a typical allocation of 10 CPU / 20 GiB RAM / 80 GiB disk.
 
-## Backup / restore
+## Health
+```bash
+docker-compose ps
+curl http://localhost:8000/health
+curl http://localhost:8000/ready
+docker-compose logs --tail=100 api
+```
+
+## Backup
 ```bash
 docker-compose exec -T api sh scripts/backup.sh /app/backup
+```
+Backup script uses pg_dump custom format and deletes local dumps older than 7 days.
+
+## Restore
+```bash
 docker-compose exec -T api sh scripts/restore.sh /app/backup/<file>.dump
 ```
-Backup retention in the POC is 7 days; production should move dumps to durable object storage and test restores on a schedule.
+Use only on an intentionally replaceable database; restore uses --clean --if-exists.
+
+## Redis
+Redis is an optimization. If unavailable, /health still works and /ready reports degraded.
+Summary cache TTL is 300 seconds.
+Dataset deletion/ingestion currently flushes cache when Redis is reachable.
 
 ## Security
-- Secrets are supplied through `.env` / deployment secret store; `.env` is git-ignored.
-- `API_KEY` is reserved for production gateway authentication; keep the POC behind a trusted network.
-- Restrict CORS, database ports, Redis ports and Swagger in production.
+Set secrets through .env/deployment secret store; never commit .env.
+API_KEY enables X-API-Key protection for non-health endpoints.
+POC CORS is allow-all; restrict origins/ports/Swagger at deployment time.
 
 ## Observability
-- `/health`, `/ready`, `/metrics` provide basic health/resource telemetry.
-- Container logs are the application logs; collect them with the production platform.
-- Recommended alerts: DB unavailable, Redis degraded, high P95/P99, disk growth, connection-pool exhaustion, failed refresh.
+Use /health, /ready, /metrics plus container logs.
+Recommended production alerts: DB unavailable, Redis degraded, disk growth, high latency, pool exhaustion, failed ingestion.
 
 ## Data lifecycle
-- `is_active=false` is the soft-delete state.
-- `updated_at` is the synchronization watermark.
-- Retention/archival policy must be finalized with the source-data owner before production.
+Canonical entity deletion currently cascades from dataset delete.
+Ingestion history is retained through ingestion_runs and related tables until dataset/run lifecycle policy is finalized.
+

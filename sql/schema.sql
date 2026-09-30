@@ -5,7 +5,6 @@ DROP TABLE IF EXISTS ingestion_h3_cells CASCADE;
 DROP TABLE IF EXISTS ingestion_parts CASCADE;
 DROP TABLE IF EXISTS ingestion_runs CASCADE;
 DROP TABLE IF EXISTS raster_datasets CASCADE;
-DROP TABLE IF EXISTS h3_features CASCADE;
 DROP TABLE IF EXISTS entity_part_h3 CASCADE;
 DROP TABLE IF EXISTS entity_parts CASCADE;
 DROP TABLE IF EXISTS entity_attributes CASCADE;
@@ -80,26 +79,6 @@ CREATE TABLE entity_part_h3 (
 );
 CREATE INDEX idx_entity_part_h3_lookup ON entity_part_h3(resolution, h3_index, part_id);
 CREATE INDEX idx_entity_part_h3_part ON entity_part_h3(part_id, resolution);
-
-CREATE TABLE h3_features (
-  h3_feature_id BIGSERIAL PRIMARY KEY,
-  dataset_id BIGINT NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
-  entity_id BIGINT NOT NULL REFERENCES entities(entity_id) ON DELETE CASCADE,
-  part_id BIGINT NOT NULL REFERENCES entity_parts(part_id) ON DELETE CASCADE,
-  resolution SMALLINT NOT NULL CHECK (resolution BETWEEN 5 AND 15),
-  h3_index TEXT NOT NULL,
-  feature_type TEXT NOT NULL CHECK (feature_type IN ('point','line','polygon')),
-  cell_coverage DOUBLE PRECISION,
-  polygon_coverage DOUBLE PRECISION,
-  centroid_cell BOOLEAN NOT NULL DEFAULT FALSE,
-  pixel_coverage DOUBLE PRECISION,
-  properties JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE(dataset_id,part_id,resolution,h3_index)
-);
-CREATE INDEX idx_h3_features_lookup ON h3_features(dataset_id,resolution,h3_index);
-CREATE INDEX idx_h3_features_entity ON h3_features(entity_id,resolution);
-CREATE INDEX idx_h3_features_properties ON h3_features USING GIN(properties);
 
 CREATE VIEW entity_h3 AS
 SELECT p.entity_id, h.resolution, h.h3_index
