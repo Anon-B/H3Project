@@ -80,3 +80,19 @@ docker-compose run --rm api python scripts/invalidate_cache.py
 ## 8. Web Ingestion Pipeline — GeoJSON
 รายละเอียดเต็มอยู่ที่ `docs/INGESTION_GEOJSON.md`.
 เปิด `http://localhost:8080` → Ingestion → เลือก/วาง GeoJSON → Preview H3 → เลือก Res11/Res8/Res5 → Run Pipeline หรือ Download H3 GeoJSON.
+
+## 9. Map — Basemap
+หน้า Map มีตัวเลือก **Basemap** สำหรับเปลี่ยนพื้นหลังแผนที่ โดยใช้ style จาก Make with MapLibre
+
+ตัวเลือกที่มี:
+- Liberty — OpenFreeMap
+- Bright — OpenFreeMap
+- Positron — OpenFreeMap
+- Dark — OpenFreeMap
+- Fiord — OpenFreeMap
+- Colorful — VersaTiles
+
+เลือกจากช่อง **Basemap** ด้านบนของแผง Map ได้ทันที โดยไม่ต้อง reload หน้าเว็บ ข้อมูล H3 / GeoJSON / Map Query ที่แสดงอยู่จะถูกสร้างกลับหลังเปลี่ยน style
+
+แหล่งรวม Basemap:
+https://makewithmaplibre.com/basemaps/
