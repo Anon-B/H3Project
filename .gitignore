@@ -8,6 +8,7 @@ data/*.csv
 data/*.parquet
 data/*.sql
 benchmarks/results/
+node_modules/
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
