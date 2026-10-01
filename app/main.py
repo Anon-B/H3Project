@@ -428,7 +428,7 @@ def dataset_detail(dataset_id:int):
 
 @app.patch("/datasets/{dataset_id}")
 def update_dataset(dataset_id:int,body:DatasetPatch):
-    allowed={"name","metadata","h3_resolution","source","owner","version","source_format","geographic_coverage","tags","license","update_frequency","schema","lineage"};changes={k:v for k,v in body.items() if k in allowed}
+    allowed={"name","metadata","h3_resolution","source","owner","version","source_format","geographic_coverage","tags","license","update_frequency","schema","lineage"};changes={k:v for k,v in body.model_dump(exclude_unset=True).items() if k in allowed}
     if not changes:raise HTTPException(400,"nothing to update")
     if "h3_resolution" in changes and not 5<=int(changes["h3_resolution"])<=15:
         raise HTTPException(400,"resolution must be 5..15")

@@ -1,7 +1,7 @@
 import os
 import httpx
 
-BASE=os.getenv("API_BASE","http://api:8000")
+BASE=os.getenv("API_BASE","http://localhost:8000")
 
 def test_health():
     r=httpx.get(BASE+"/health",timeout=10)
