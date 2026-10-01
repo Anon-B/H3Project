@@ -1,4 +1,6 @@
-import argparse, csv, random
+import argparse
+import csv
+import random
 import h3
 
 p=argparse.ArgumentParser()

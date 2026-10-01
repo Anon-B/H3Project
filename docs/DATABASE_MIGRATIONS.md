@@ -11,6 +11,21 @@
 `002_h3_analytics_catalog.sql` belongs to the transition that introduced entity attributes, Boundary-H3 analytics/catalog concepts and dataset metadata.
 Always inspect the migration before applying it to an existing DB.
 
+## Migration tracking
+
+Current databases use schema_migrations with one row per applied migration.
+The canonical fresh schema records the current baseline and the startup runner
+applies any migration files that are newer than that baseline.
+
+The standard startup path is:
+
+1. Start PostgreSQL/Redis/API/frontend.
+2. Wait for API availability.
+3. Run scripts/migrate.sh inside the API container.
+4. Start/verify the API health endpoints.
+
+scripts/migrate.sh is idempotent: an already applied migration is skipped.
+
 ## Fresh database
 ```bash
 docker-compose down
@@ -18,7 +33,7 @@ docker volume ls
 docker-compose up -d --build
 docker-compose exec -T db psql -U h3 -d h3project -f /app/sql/schema.sql
 ```
-Do not run schema.sql against a database that contains data you need; it contains DROP TABLE statements.
+Do not run schema.sql against a database that contains data you need; use the migration runner instead.
 
 ## Existing database
 Back up first.

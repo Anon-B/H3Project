@@ -1,4 +1,5 @@
-import json,urllib.request
+import json
+import urllib.request
 p=json.load(open('data/ingest_test.json'))
 for ep in ('preview','execute'):
  url='http://127.0.0.1:8000/ingestion/geojson/'+ep

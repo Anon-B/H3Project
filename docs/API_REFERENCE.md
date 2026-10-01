@@ -16,6 +16,9 @@ Returns database, user-table, user-index byte sizes and Redis status.
 Query: `limit=1..500`. Returns dataset registry + entity/part/Boundary-H3 counts.
 ### GET /datasets/{dataset_id}
 Returns one dataset with metadata/catalog and counts.
+
+### GET /datasets/{dataset_id}/export
+Returns GeoJSON. The Content-Disposition header includes an RFC 5987 UTF-8 filename for non-ASCII dataset names.
 ### PATCH /datasets/{dataset_id}
 Accepts name, metadata, source, owner, version, source_format, geographic_coverage, tags, license, update_frequency, schema, lineage and h3_resolution.
 Frontend intentionally locks resolution during normal edit.
@@ -84,6 +87,18 @@ Returns recent ingestion runs; limit 1..100.
 Returns run metadata and H3 storage statistics.
 
 ## Authentication
-Set `API_KEY` in the API environment. All endpoints except /health and /ready then require `X-API-Key`.
-POC CORS is currently allow-all and should be restricted before production.
+Authentication supports API keys and JWT/OIDC bearer tokens.
+
+- API keys can be mapped to roles with API_KEYS_JSON, for example {"viewer-key":"viewer","editor-key":"editor"}.
+- API_KEY remains supported as a backward-compatible single admin key.
+- Invalid API keys always return 401.
+- AUTH_MODE=required requires credentials on non-public endpoints.
+- Write endpoints use role dependencies: editor/writer/admin for dataset updates and ingestion; admin/editor for rollback.
+- Frontend can send VITE_API_KEY through X-API-Key or VITE_API_TOKEN through Authorization: Bearer.
+- Public health endpoints include /health, /healthz, /ready, /readyz, /metrics and /metrics/prometheus.
+- CORS is controlled by CORS_ORIGINS.
+
+## Background ingestion
+POST /ingestion/geojson/execute supports `background=true`.
+It returns HTTP 202 with a job_id. Poll GET /ingestion/jobs/{job_id} for queued/running/completed/failed status.
 

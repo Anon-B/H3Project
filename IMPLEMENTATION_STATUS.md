@@ -36,7 +36,7 @@ See docs/API_REFERENCE.md for exact contracts.
 ## Verified runtime facts
 - API health returns status ok when DB is available.
 - Frontend container builds successfully with TypeScript/Vite.
-- Current branch: feature/ingestion.
+- Current branch: feature/next.
 - Docker command on this machine: docker-compose.
 
 ## Important legacy boundary

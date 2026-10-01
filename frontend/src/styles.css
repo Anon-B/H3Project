@@ -216,3 +216,5 @@ table{width:100%;border-collapse:collapse;font-size:11px}th,td{text-align:left;p
 
 /* Settings are live application preferences */
 .app{--accent:#4264fb}.app .MuiButton-contained{background-color:var(--accent)!important}.app .MuiButton-contained:hover{filter:brightness(.94)}.app .MuiButton-outlined{border-color:color-mix(in srgb,var(--accent) 38%,#d9dce1)}.app .MuiSwitch-switchBase.Mui-checked{color:var(--accent)}.app .MuiSwitch-switchBase.Mui-checked+.MuiSwitch-track{background-color:var(--accent)}.app .MuiCheckbox-root.Mui-checked{color:var(--accent)}.app.compact .page{padding-top:14px}.app.compact .sectionCard{margin-bottom:8px}.app.compact .metricGrid{gap:8px}.app.compact .tableSub{line-height:1.1}.app.noAnimations *{transition:none!important;animation:none!important}
+:where(button,a,input,select,textarea,[role="button"],[tabindex]):focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}

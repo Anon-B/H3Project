@@ -1,4 +1,6 @@
-import os,psycopg,h3
+import os
+import psycopg
+import h3
 DB=os.getenv("DATABASE_URL","postgresql://h3:h3@db:5432/h3project")
 with psycopg.connect(DB) as conn:
   with conn.cursor() as cur:

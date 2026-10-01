@@ -3,7 +3,7 @@ CREATE EXTENSION IF NOT EXISTS postgis;
 
 CREATE TABLE datasets (
   dataset_id BIGSERIAL PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
   data_type TEXT NOT NULL CHECK (data_type IN ('point','multipoint','line','multiline','polygon','multipolygon','geometry_collection','raster','mixed')),
   h3_resolution SMALLINT NOT NULL CHECK (h3_resolution BETWEEN 5 AND 15),
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -27,7 +27,7 @@ CREATE TABLE entities (
   dataset_id BIGINT NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE
 );
 CREATE INDEX idx_entities_dataset ON entities(dataset_id, entity_id);
-CREATE INDEX idx_datasets_active_name ON datasets(name) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX uq_datasets_active_name ON datasets(name) WHERE deleted_at IS NULL;
 
 CREATE TABLE entity_parts (
   part_id BIGSERIAL PRIMARY KEY,
@@ -145,6 +145,13 @@ CREATE UNIQUE INDEX uq_ingestion_h3_run_cell ON ingestion_h3_cells(run_id,resolu
 
 ANALYZE;
 
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version TEXT PRIMARY KEY,
+  description TEXT NOT NULL,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO schema_migrations(version,description) VALUES ('004','baseline from current schema') ON CONFLICT(version) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS ingestion_jobs (
   job_id UUID PRIMARY KEY,

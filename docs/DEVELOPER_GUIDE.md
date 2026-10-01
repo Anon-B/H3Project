@@ -9,6 +9,8 @@
 - Python only if running backend/scripts outside Docker.
 
 ## 2. Start
+
+Preferred startup is start-project.sh because it also runs idempotent database migrations.
 ```bash
 cd /Users/anonpond/H3Project
 colima start --cpu 10 --memory 20 --disk 80
@@ -26,15 +28,21 @@ docker-compose logs --tail=100 frontend
 ```
 
 ## 4. Frontend development
-Source is `frontend/src/App.tsx`, `styles.css`, `muiTheme.ts`.
-Build: `npm --prefix frontend run build`.
+Application composition starts in frontend/src/App.tsx; dataset catalog logic is in frontend/src/components/DatasetsPage.tsx.
+API access is centralized in frontend/src/lib/api.ts.
+Build: npm --prefix frontend run build.
+Lint: npm --prefix frontend run lint.
+Format check: npm --prefix frontend run format:check.
 Docker deploy: `docker-compose build frontend && docker-compose up -d --force-recreate frontend`.
 Frontend container serves built assets with Nginx.
 
 ## 5. Backend development
-Main API is a single module: `app/main.py`.
-Fresh DB schema: `sql/schema.sql`.
-Existing DB changes: use a migration under `sql/migrations/` and verify it against the live schema.
+Main API is currently app/main.py.
+Fresh DB schema: sql/schema.sql.
+Existing DB changes: use a migration under sql/migrations/ and verify it against the live schema.
+Migration runner: scripts/migrate.sh.
+Ruff: .venv/bin/ruff check app scripts tests.
+Runtime dependencies are pinned in requirements.txt; development/test dependencies are in requirements-dev.txt.
 
 ## 6. Tests
 ```bash
@@ -54,9 +62,14 @@ For GeoJSON work, verify Preview -> Execute -> Dataset Registry -> Map.
 8. Change analytics/style/3D and confirm immediate UI response.
 
 ## 8. Git
-Current workflow: feature/* -> develop -> main.
-For current project work use `feature/ingestion` unless the task belongs elsewhere.
-Never develop directly on develop/main.
+Current workflow:
+
+```text
+feature/next -> develop -> release/vX.Y.Z (when needed) -> main
+```
+
+`feature/next` is the active development branch. Do not keep permanent domain branches such as `feature/api`, `feature/database`, `feature/h3`, `feature/ingestion`, or `feature/map`. Temporary branches may be created only for a clearly scoped task and should be deleted after merge.
+Never develop directly on `develop` or `main`.
 
 ## 9. Safe change sequence
 Read architecture -> read data model -> change backend/schema -> update API docs -> update frontend -> build -> test -> inspect git diff -> commit.

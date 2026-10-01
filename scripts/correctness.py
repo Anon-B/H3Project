@@ -1,5 +1,4 @@
 import os
-import math
 import httpx
 import psycopg
 

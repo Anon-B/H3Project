@@ -1,4 +1,7 @@
-import os,uuid,json,time,httpx
+import os
+import uuid
+import time
+import httpx
 BASE=os.getenv('API_BASE','http://localhost:8000'); C=httpx.Client(base_url=BASE,timeout=20)
 
 def test_health_ready_metrics():
@@ -65,7 +68,7 @@ def test_geojson_preview_multi_geometries_and_resolutions():
 
 def test_dataset_soft_delete_and_restore_metadata():
     name='lifecycle-'+uuid.uuid4().hex[:8]; p={'type':'FeatureCollection','features':[{'type':'Feature','geometry':{'type':'Point','coordinates':[100.5018,13.7563]},'properties':{}}]}
-    body=C.post(f'/ingestion/geojson/execute?resolution=11&dataset={name}',json=p).json(); ds=C.get('/ingestion/datasets').json()['datasets']; did=next(x['dataset_id'] for x in ds if x['dataset']==name)
+    C.post(f'/ingestion/geojson/execute?resolution=11&dataset={name}',json=p); ds=C.get('/ingestion/datasets').json()['datasets']; did=next(x['dataset_id'] for x in ds if x['dataset']==name)
     r=C.patch(f'/datasets/{did}',json={'metadata':{'test':'lifecycle'}}); assert r.status_code==200
     r=C.delete(f'/datasets/{did}'); assert r.status_code==200
     assert C.get(f'/datasets/{did}').status_code in (200,404)

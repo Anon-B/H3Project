@@ -1,156 +1,113 @@
 # Git Workflow — H3Project
 เอกสาร workflow สำหรับพัฒนา H3Project ด้วย Git
 
-> **กฎสำคัญของโปรเจกต์:** ทำงานคนเดียว และงานพัฒนา/แก้ไขโค้ดทุกอย่างต้องเริ่มและทำบน `feature/*` ก่อนเสมอ ห้ามพัฒนาโดยตรงบน `develop` หรือ `main`
+> **กฎสำคัญ:** H3Project เป็นโปรเจกต์ที่ทำงานคนเดียว จึงใช้ branch เท่าที่จำเป็นและลบ branch ชั่วคราวหลัง merge
 
-## 1. Branch หลัก
-
-- `main` — เวอร์ชัน stable / production
-- `develop` — รวมงาน development และ integration/test
-- `feature/*` — งานพัฒนาและ feature ทั้งหมด
-- `experiment` — งานทดลอง / benchmark / POC ที่ยังไม่พร้อมเข้า develop
-- `release/*` — ใช้เฉพาะเมื่อเตรียม release version สำคัญ
-- `fix/*` — ใช้เมื่อจำเป็นต้องแยก bug fix จาก develop
-- `hotfix/*` — ใช้เฉพาะปัญหาเร่งด่วนบน main
-
-## 2. Workflow ที่ใช้จริง
-
-สำหรับการทำงานคนเดียว ใช้ workflow หลักแบบง่าย:
+## 1. Branch ที่ใช้งานจริง
 
 ```text
-feature/*
-    ↓
-develop
-    ↓
 main
-```
+  └── stable / production
 
-เมื่อเตรียม release version สำคัญ สามารถเพิ่ม:
-
-```text
-feature/*
-    ↓
 develop
-    ↓
+  └── integration / testing
+
+feature/next
+  └── active development
+
 release/vX.Y.Z
+  └── temporary release preparation
+```
+
+### Permanent / Active
+
+- `main` — stable / production
+- `develop` — integration และ testing ก่อน release
+- `feature/next` — active development branch สำหรับงานรอบถัดไป
+
+### Temporary
+
+- `release/vX.Y.Z` — สร้างเฉพาะเมื่อจำเป็นต้องเตรียม release และลบได้หลัง release
+- temporary `feature/*`, `fix/*`, `hotfix/*` — สร้างเฉพาะงานที่มีเหตุผลต้องแยกจริง และลบหลัง merge
+
+### ไม่ใช้เป็น permanent branch
+
+ไม่มี branch ถาวรสำหรับ:
+
+```text
+feature/api
+feature/database
+feature/h3
+feature/ingestion
+feature/map
+experiment
+experiment-performance
+experiment-scale-100m
+```
+
+งาน API, Database, H3, Ingestion และ Map ให้ทำบน `feature/next` เว้นแต่มีเหตุผลชัดเจนที่จะสร้าง temporary branch เฉพาะงาน
+
+## 2. Workflow หลัก
+
+```text
+feature/next
+    ↓
+develop
+    ↓
+release/vX.Y.Z   (เมื่อจำเป็น)
     ↓
 main
 ```
 
-### หลักการ
+หลักการ:
 
-1. **เขียนโค้ด / เพิ่ม feature / แก้ไขงาน → ทำบน `feature/*`**
-2. **รวมงานและทดสอบ integration → `develop`**
-3. **พร้อมใช้งานจริง → `main`**
-4. **งานทดลองที่ยังไม่แน่ใจ → `experiment`**
-5. **release branch ไม่ต้องสร้างทุกครั้ง ใช้เมื่อมีเหตุผลด้าน release**
-6. หลัง merge แล้วสามารถลบ feature branch ได้ แต่ branch หลักของโปรเจกต์ยังคงใช้ตามหน้าที่เดิม
+1. งานพัฒนารอบถัดไป → `feature/next`
+2. รวมงานและ integration test → `develop`
+3. เตรียม release → `release/vX.Y.Z` เมื่อจำเป็น
+4. release ที่ stable → `main`
+5. ห้ามพัฒนาโดยตรงบน `develop` หรือ `main`
 
-## 3. Feature Branch ที่ใช้ใน H3Project
-
-ใช้เฉพาะ Feature branch ระดับหลัก ไม่แตก branch ย่อยตามฟังก์ชัน:
-
-- `feature/api`
-- `feature/database`
-- `feature/h3`
-- `feature/ingestion`
-- `feature/map`
-
-ตัวอย่าง: GeoJSON, drawing, bbox หรือ Redis ให้ทำภายใต้ Feature ที่เกี่ยวข้อง
-
-**ห้ามสร้าง feature branch ย่อย** เช่น `feature/ingestion-geojson`
-
-## 4. วิธีเริ่มงานใหม่
-
-เลือก Feature ที่เกี่ยวข้อง แล้วทำงานบน branch นั้น:
+## 3. เริ่มงาน
 
 ```bash
-git switch develop
-git pull origin develop
-git switch feature/<ชื่อ-feature>
+git switch feature/next
+git pull origin feature/next
 ```
 
-ถ้า Feature branch ยังไม่มี ให้สร้างจาก develop:
-
-```bash
-git switch develop
-git pull origin develop
-git switch -c feature/<ชื่อ-feature>
-```
-
-> **สำคัญ:** หลังจาก switch เข้า `feature/*` แล้ว การแก้ไขทั้งหมดของงานนั้นให้ทำบน Feature branch เท่านั้น
-
-## 5. Commit และ Push
+ตรวจสอบก่อนแก้ไข:
 
 ```bash
 git status
-git add .
-git commit -m "feat: <รายละเอียด>"
-git push -u origin feature/<ชื่อ-feature>
+git branch -vv
 ```
 
-จากนั้น merge เข้า `develop` หลังทดสอบงานเรียบร้อย
+## 4. Temporary Feature Branch
 
-## 6. ตัวอย่าง
-
-### GeoJSON Ingestion
-
-ใช้:
+สร้าง temporary branch เฉพาะเมื่อ scope ใหญ่พอที่จะต้องแยกจาก `feature/next` เช่น:
 
 ```bash
-git switch feature/ingestion
+git switch feature/next
+git pull origin feature/next
+git switch -c feature/ingestion-geojson
 ```
 
-ทำ GeoJSON, Polygon, Dataset หรือ ingestion function ทั้งหมดใน branch นี้
-
-ไม่สร้าง branch แยกตามฟังก์ชัน
-
-### Map
-
-ใช้:
+ทำเสร็จแล้ว merge กลับ `feature/next` และลบ branch:
 
 ```bash
-git switch feature/map
+git switch feature/next
+git merge feature/ingestion-geojson
+git branch -d feature/ingestion-geojson
+git push origin --delete feature/ingestion-geojson
 ```
 
-งาน drawing, layer toggle, map query และ map UI ทำใน branch นี้
+ไม่ควรสร้าง branch กว้าง ๆ ที่ค้างถาวร เช่น `feature/api` หรือ `feature/map`
 
-### API
+## 5. Develop
 
-ใช้:
-
-```bash
-git switch feature/api
-```
-
-งาน endpoint และ API behavior ทำใน branch นี้
-
-## 7. Bug Fix
-
-ถ้าเป็น bug ของงานที่กำลังพัฒนา ให้แก้ใน Feature branch ที่เกี่ยวข้องก่อน
-
-ตัวอย่าง:
-
-```bash
-git switch feature/ingestion
-```
-
-ถ้าเป็น bug ที่ไม่สามารถผูกกับ Feature หลักได้จริง ค่อยสร้าง `fix/*` จาก `develop`
+`develop` ใช้สำหรับ integration/testing เท่านั้น
 
 ```text
-fix/* → develop
-```
-
-## 8. Develop
-
-`develop` มีหน้าที่เป็น **integration/testing branch**
-
-ห้ามใช้ `develop` เป็นพื้นที่พัฒนาโดยตรง
-
-Flow:
-
-```text
-feature/*
+feature/next
      ↓
    merge
      ↓
@@ -159,74 +116,68 @@ feature/*
 integration test
 ```
 
-## 9. Main
+ห้ามใช้ `develop` เป็นพื้นที่พัฒนาโดยตรง
 
-`main` คือ stable / production
+## 6. Main
+
+`main` คือ stable / production branch
 
 ห้ามพัฒนาโดยตรงบน `main`
 
-Flow ปกติ:
-
-```text
-feature/*
-    ↓
-develop
-    ↓
-main
-```
-
-## 10. Release
+## 7. Release
 
 ไม่จำเป็นต้องสร้าง `release/*` ทุกครั้ง
 
-ใช้เมื่อมีการเตรียม version สำคัญ:
+เมื่อจำเป็น:
 
 ```text
 develop
     ↓
-release/v1.1.0
+release/v1.3.0
     ↓
 main
 ```
 
-ก่อน release ให้ตรวจสอบ:
-
-- API
-- Frontend
-- Database
-- Docker
-- Tests
-- Documentation
-
-หลัง release ให้สร้าง tag:
+หลัง release ให้สร้าง tag บน commit ที่ release จริง:
 
 ```bash
 git switch main
-git tag -a v1.1.0 -m "Release v1.1.0"
+git tag -a v1.3.0 -m "Release v1.3.0"
 git push origin main
-git push origin v1.1.0
+git push origin v1.3.0
 ```
 
-## 11. Experiment
+release branch ที่ไม่ต้อง maintenance ต่อสามารถลบได้:
 
-มี branch ทดลองเพียงตัวเดียว:
+```bash
+git branch -d release/v1.3.0
+git push origin --delete release/v1.3.0
+```
+
+## 8. Bug Fix / Hotfix
+
+Bug fix ของงานปัจจุบันให้ทำบน `feature/next` หาก scope เล็กและไม่ต้องแยก branch
+
+ถ้าต้องแยกจริง ใช้ temporary:
 
 ```text
-experiment
+fix/*
+hotfix/*
 ```
 
-ใช้สำหรับ:
+และลบหลัง merge
 
-- benchmark
-- query tuning
-- Redis test
-- H3 performance
-- 50M / 100M scale test
-- POC ที่ยังไม่พร้อมเข้า develop
+## 9. Commit / Push
 
-ไม่ต้องสร้าง experiment branch เพิ่มสำหรับแต่ละการทดลอง
+```bash
+git status
+git diff
+git add .
+git commit -m "feat: <รายละเอียด>"
+git push -u origin feature/next
+```
 
-## 12. Commit Convention
+Commit convention:
 
 - `feat:` เพิ่ม feature
 - `fix:` แก้ bug
@@ -235,15 +186,49 @@ experiment
 - `test:` เพิ่มหรือแก้ test
 - `chore:` maintenance / config
 
-ตัวอย่าง:
+## 10. ตรวจสอบก่อน Commit
+
+```bash
+git status
+git diff
+git diff --cached
+git diff --check
+```
+
+หลัง commit:
+
+```bash
+git log --oneline -5
+git status
+```
+
+## 11. Sync กับ Develop
+
+ถ้า `develop` มีการเปลี่ยนแปลง:
+
+```bash
+git switch develop
+git pull origin develop
+git switch feature/next
+git merge develop
+```
+
+แก้ conflict ถ้ามี แล้ว test ใหม่ก่อน push
+
+## 12. Current Branch Policy
+
+Branch ที่ควรเห็นในการทำงานปกติ:
 
 ```text
-feat: add GeoJSON ingestion
-fix: correct H3 resolution validation
-docs: update Git workflow
-test: add nearby API test
-chore: update docker configuration
+main
+develop
+feature/next
+release/vX.Y.Z   # เฉพาะ release ที่กำลังเตรียม
 ```
+
+release branch รุ่นเก่าที่มี release/tag history แล้วสามารถคงไว้เป็น historical reference ได้ตาม repository policy
+
+ไม่ควรมี permanent domain feature branch หรือ experiment branch
 
 ## 13. สิ่งที่ไม่ควร Commit
 
@@ -256,52 +241,7 @@ chore: update docker configuration
 - local cache
 - credentials
 
-โปรเจกต์นี้มี:
-
-```gitignore
-backups/*.dump
-```
-
-เพื่อป้องกัน database dump เข้า Git
-
-## 14. ตรวจสอบก่อน Commit
-
-```bash
-git status
-git diff
-git diff --cached
-```
-
-หลัง commit:
-
-```bash
-git log --oneline -5
-git status
-```
-
-## 15. Sync Feature กับ Develop
-
-ถ้า Feature ทำงานนานและ `develop` มีการเปลี่ยนแปลง:
-
-```bash
-git switch develop
-git pull origin develop
-git switch feature/<ชื่อ-feature>
-git merge develop
-```
-
-แก้ conflict ถ้ามี แล้ว test ใหม่ก่อน push
-
-## 16. ลบ Feature Branch หลัง Merge
-
-เมื่อ Feature merge เข้า `develop` แล้ว:
-
-```bash
-git branch -d feature/<ชื่อ-feature>
-git push origin --delete feature/<ชื่อ-feature>
-```
-
-## 17. GitHub Remote
+## 14. GitHub Remote
 
 Repository:
 
@@ -314,48 +254,25 @@ git remote -v
 git branch -a
 ```
 
-## 18. Workflow สั้น ๆ ที่ต้องจำ
+## 15. สรุป Workflow
 
 ```text
 งานใหม่
    ↓
-feature/*
+feature/next
    ↓
 test
-   ↓
-merge
    ↓
 develop
    ↓
 integration test
    ↓
+release/vX.Y.Z  (ถ้าจำเป็น)
+   ↓
 main
 ```
 
-Release สำคัญ:
-
-```text
-develop → release/vX.Y.Z → main
-```
-
-Experiment:
-
-```text
-experiment
-```
-
-## 19. Project Rule / Note
-
-> **H3Project เป็นโปรเจกต์ที่ทำงานคนเดียว ดังนั้นให้ใช้ Git workflow แบบเรียบง่าย**
->
-> **ทุกการพัฒนา การเพิ่ม function การแก้ไข code และ bug fix ต้องทำบน `feature/*` ก่อน**
->
-> `develop` ใช้สำหรับรวมงานและทดสอบ  
-> `main` ใช้สำหรับ stable / production  
-> `release/*` ใช้เฉพาะตอนเตรียม release สำคัญ  
-> `experiment` ใช้สำหรับงานทดลอง
->
-> **ห้ามพัฒนาโดยตรงบน `develop` หรือ `main`**
+> **Project rule:** ไม่ใช้ permanent branch แยก API / Database / H3 / Ingestion / Map และไม่ใช้ permanent experiment branch
 
 Repository:
 `https://github.com/Anon-B/H3Project.git`

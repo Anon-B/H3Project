@@ -1,22 +1,31 @@
-import os,time,json,hmac,uuid,logging,threading
+import os
+import time
+import json
+import uuid
+import logging
+import threading
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
-import h3,orjson,redis
+from urllib.parse import quote
+import h3
+import orjson
+import redis
 from pyproj import Geod
-from shapely.geometry import shape,Polygon,MultiPolygon,mapping
-from shapely.ops import unary_union
+from shapely.geometry import shape,Polygon,MultiPolygon
 from psycopg_pool import ConnectionPool
-from fastapi import FastAPI,Query,HTTPException,Body,Request
+from fastapi import FastAPI,Query,HTTPException,Body,Request,Depends
 from fastapi.responses import ORJSONResponse,StreamingResponse
 from pydantic import BaseModel,Field,ConfigDict
 import jwt
 from jwt import PyJWKClient
-from prometheus_client import Counter,Histogram,generate_latest,CONTENT_TYPE_LATEST
+from prometheus_client import Counter,Histogram,generate_latest,CONTENT_TYPE_LATEST,CollectorRegistry,multiprocess
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
 DB=os.getenv("DATABASE_URL","postgresql://h3:h3@db:5432/h3project")
 REDIS=os.getenv("REDIS_URL","redis://redis:6379/0")
 API_KEY=os.getenv("API_KEY","").strip()
+API_KEYS_JSON=os.getenv("API_KEYS_JSON","").strip()
 JWT_SECRET=os.getenv("JWT_SECRET","").strip()
 AUTH_MODE=os.getenv("AUTH_MODE","optional").strip().lower()
 JWT_ALGORITHM=os.getenv("JWT_ALGORITHM","HS256")
@@ -28,6 +37,12 @@ OIDC_ISSUER=os.getenv("OIDC_ISSUER","").strip() or None
 OIDC_JWKS=PyJWKClient(OIDC_JWKS_URL) if OIDC_JWKS_URL else None
 RATE_LIMIT=int(os.getenv("RATE_LIMIT_PER_MINUTE","120"))
 CORS_ORIGINS=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:8080,http://127.0.0.1:8080").split(",") if x.strip()]
+try:
+    API_KEYS={str(k):str(v) for k,v in json.loads(API_KEYS_JSON).items()} if API_KEYS_JSON else {}
+except (TypeError,ValueError):
+    API_KEYS={}
+if API_KEY and API_KEY not in API_KEYS:
+    API_KEYS[API_KEY]="admin"
 GEOD=Geod(ellps="WGS84")
 
 class IngestionRequest(BaseModel):
@@ -57,13 +72,16 @@ class DatasetPatch(BaseModel):
     source_format:str|None=None; geographic_coverage:dict|None=None; tags:list[str]|None=None; license:str|None=None
     update_frequency:str|None=None; schema:dict|None=None; lineage:dict|None=None
 
-app=FastAPI(title="H3Project API",version="1.2.0",default_response_class=ORJSONResponse)
+app=FastAPI(title="H3Project API",version="1.3.0",default_response_class=ORJSONResponse)
+app.add_middleware(CORSMiddleware,allow_origins=CORS_ORIGINS,allow_credentials=False,allow_methods=["*"],allow_headers=["*"],expose_headers=["X-Request-ID"])
+app.add_middleware(GZipMiddleware,minimum_size=1000)
 logger=logging.getLogger("h3project")
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO").upper(),format="%(asctime)s %(levelname)s %(name)s %(message)s")
 executor=ThreadPoolExecutor(max_workers=int(os.getenv("INGESTION_WORKERS","2")))
 jobs={}
 jobs_lock=threading.Lock()
-REQ_COUNT=Counter("h3_http_requests_total","HTTP requests",["method","path","status"])
-REQ_LATENCY=Histogram("h3_http_request_seconds","HTTP request latency",["method","path"])
+REQ_COUNT=Counter("h3_http_requests_total","HTTP requests",["method","route","status"])
+REQ_LATENCY=Histogram("h3_http_request_seconds","HTTP request latency",["method","route"])
 INGEST_COUNT=Counter("h3_ingestion_runs_total","Ingestion runs",["status"])
 rdb=redis.Redis.from_url(REDIS,decode_responses=True)
 pool=ConnectionPool(DB,min_size=2,max_size=20,open=True)
@@ -72,54 +90,85 @@ pool=ConnectionPool(DB,min_size=2,max_size=20,open=True)
 async def observability(request:Request,call_next):
     rid=request.headers.get("x-request-id") or str(uuid.uuid4())
     started=time.perf_counter()
+    route_label=getattr(request.scope.get("route"),"path",request.url.path)
     try:
         response=await call_next(request)
     except Exception:
-        REQ_COUNT.labels(request.method,request.url.path,"500").inc()
+        REQ_COUNT.labels(request.method,route_label,"500").inc()
         logger.exception("request_failed request_id=%s path=%s",rid,request.url.path)
         raise
     elapsed=time.perf_counter()-started
-    REQ_COUNT.labels(request.method,request.url.path,str(response.status_code)).inc()
-    REQ_LATENCY.labels(request.method,request.url.path).observe(elapsed)
+    route_label=getattr(request.scope.get("route"),"path",route_label)
+    REQ_COUNT.labels(request.method,route_label,str(response.status_code)).inc()
+    REQ_LATENCY.labels(request.method,route_label).observe(elapsed)
     response.headers["X-Request-ID"]=rid
     logger.info("request request_id=%s method=%s path=%s status=%s duration_ms=%.2f",rid,request.method,request.url.path,response.status_code,elapsed*1000)
     return response
 
+def _identity_roles(identity):
+    roles=set(identity.get("roles",[]) or [])
+    roles.update(identity.get("groups",[]) or [])
+    roles.update((identity.get("realm_access") or {}).get("roles",[]) or [])
+    return roles
+
 @app.middleware("http")
 async def auth(request:Request,call_next):
-    public={"/health","/ready","/metrics","/docs","/openapi.json","/redoc"}
-    if request.url.path not in public:
-        identity=None
-        token=request.headers.get("authorization","")
-        if token.lower().startswith("bearer "):
-            try:
-                raw=token[7:]
-                if JWT_SECRET:
-                    identity=jwt.decode(raw,JWT_SECRET,algorithms=[JWT_ALGORITHM],audience=OIDC_AUDIENCE,issuer=OIDC_ISSUER,leeway=AUTH_LEEWAY,options={"require":["exp"]})
-                elif OIDC_JWKS:
-                    signing_key=OIDC_JWKS.get_signing_key_from_jwt(raw).key
-                    identity=jwt.decode(raw,signing_key,algorithms=OIDC_ALGORITHMS,audience=OIDC_AUDIENCE,issuer=OIDC_ISSUER,leeway=AUTH_LEEWAY,options={"require":["exp"]})
-            except jwt.PyJWTError: return ORJSONResponse({"detail":"invalid bearer token"},status_code=401)
-        if API_KEY and not hmac.compare_digest(request.headers.get("x-api-key", ""),API_KEY) and identity is None:
-            if AUTH_MODE=="required": return ORJSONResponse({"detail":"authentication required"},status_code=401)
-        request.state.identity=identity or {}
-        if AUTH_MODE=="required" and not identity and not API_KEY: return ORJSONResponse({"detail":"authentication required"},status_code=401)
-        if request.method in {"POST","PATCH","DELETE"} and AUTH_MODE=="required":
-            roles=set(request.state.identity.get("roles",[]))
-            roles.update(request.state.identity.get("groups",[]) or [])
-            roles.update((request.state.identity.get("realm_access") or {}).get("roles",[]) or [])
-            if not roles.intersection({"admin","editor","writer"}): return ORJSONResponse({"detail":"write role required"},status_code=403)
-        if RATE_LIMIT>0 and redis_ok():
-            subject=str((identity or {}).get("sub") or request.client.host or "anonymous")
+    public={"/health","/healthz","/ready","/readyz","/metrics","/metrics/prometheus","/docs","/openapi.json","/redoc"}
+    identity={}
+    bearer=request.headers.get("authorization","")
+    api_token=request.headers.get("x-api-key","")
+    if bearer and not bearer.lower().startswith("bearer "):
+        return ORJSONResponse({"detail":"invalid authorization header"},status_code=401)
+    if bearer.lower().startswith("bearer "):
+        try:
+            raw=bearer[7:]
+            if JWT_SECRET:
+                identity=jwt.decode(raw,JWT_SECRET,algorithms=[JWT_ALGORITHM],audience=OIDC_AUDIENCE,issuer=OIDC_ISSUER,leeway=AUTH_LEEWAY,options={"require":["exp"]})
+            elif OIDC_JWKS:
+                signing_key=OIDC_JWKS.get_signing_key_from_jwt(raw).key
+                identity=jwt.decode(raw,signing_key,algorithms=OIDC_ALGORITHMS,audience=OIDC_AUDIENCE,issuer=OIDC_ISSUER,leeway=AUTH_LEEWAY,options={"require":["exp"]})
+            else:
+                return ORJSONResponse({"detail":"bearer authentication is not configured"},status_code=401)
+        except jwt.PyJWTError:
+            return ORJSONResponse({"detail":"invalid bearer token"},status_code=401)
+    if api_token:
+        role=API_KEYS.get(api_token)
+        if not role:
+            return ORJSONResponse({"detail":"invalid api key"},status_code=401)
+        if identity:
+            identity=dict(identity)
+            identity["roles"]=list(_identity_roles(identity)|{role})
+        else:
+            identity={"sub":"api-key","roles":[role]}
+    if request.url.path not in public and AUTH_MODE=="required" and not identity:
+        return ORJSONResponse({"detail":"authentication required"},status_code=401)
+    request.state.identity=identity
+    request.state.roles=_identity_roles(identity)
+    if request.url.path not in public and RATE_LIMIT>0:
+        redis_available=await asyncio.to_thread(redis_ok)
+        if redis_available:
+            subject=str(identity.get("sub") or request.client.host or "anonymous")
             bucket=int(time.time()//60);key=f"rate:{subject}:{bucket}"
-            n=int(rdb.incr(key));rdb.expire(key,61)
-            if n>RATE_LIMIT:return ORJSONResponse({"detail":"rate limit exceeded"},status_code=429,headers={"Retry-After":"60"})
+            n=await asyncio.to_thread(_rate_limit_increment,key)
+            if n>RATE_LIMIT:
+                return ORJSONResponse({"detail":"rate limit exceeded"},status_code=429,headers={"Retry-After":"60"})
     return await call_next(request)
 
 def db_conn(): return pool.connection()
 def redis_ok():
     try:return bool(rdb.ping())
     except Exception:return False
+
+def _rate_limit_increment(key):
+    n=int(rdb.incr(key));rdb.expire(key,61);return n
+
+def require_roles(*allowed):
+    def dependency(request:Request):
+        if not request.state.identity and AUTH_MODE!="required":
+            return
+        if not request.state.roles.intersection(set(allowed)):
+            raise HTTPException(403,"insufficient role")
+    return dependency
 
 def invalidate_cache(dataset=None):
     try:
@@ -364,6 +413,7 @@ def _preview(payload,res):
             "features":rows}
 
 @app.get("/health")
+@app.get("/healthz")
 def health():
     try:
         with db_conn() as c:
@@ -372,6 +422,7 @@ def health():
     return {"status":"ok","entities":count,"redis":redis_ok()}
 
 @app.get("/ready")
+@app.get("/readyz")
 def ready():
     h=health();return {"status":"ready" if h["redis"] else "degraded","database":True,"redis":h["redis"]}
 
@@ -386,7 +437,13 @@ def metrics():
 
 @app.get("/metrics/prometheus")
 def prometheus_metrics():
-    return StreamingResponse(iter([generate_latest()]),media_type=CONTENT_TYPE_LATEST)
+    if os.getenv("PROMETHEUS_MULTIPROC_DIR"):
+        registry=CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        payload=generate_latest(registry)
+    else:
+        payload=generate_latest()
+    return StreamingResponse((chunk for chunk in (payload,)),media_type=CONTENT_TYPE_LATEST)
 
 @app.get("/ingestion/datasets")
 def ingestion_datasets(limit:int=Query(100,ge=1,le=500)):
@@ -426,7 +483,7 @@ def dataset_detail(dataset_id:int):
             "schema":x[15] or {},"lineage":x[16] or {},"entity_count":x[17],"part_count":x[18],
             "boundary_h3_count":x[19],"storage_mode":"boundary_h3"}
 
-@app.patch("/datasets/{dataset_id}")
+@app.patch("/datasets/{dataset_id}",dependencies=[Depends(require_roles("admin","editor","writer"))])
 def update_dataset(dataset_id:int,body:DatasetPatch):
     allowed={"name","metadata","h3_resolution","source","owner","version","source_format","geographic_coverage","tags","license","update_frequency","schema","lineage"};changes={k:v for k,v in body.model_dump(exclude_unset=True).items() if k in allowed}
     if not changes:raise HTTPException(400,"nothing to update")
@@ -444,16 +501,16 @@ def update_dataset(dataset_id:int,body:DatasetPatch):
     if "h3_resolution" in changes:sets.append("h3_resolution=%s");vals.append(int(changes["h3_resolution"]))
     with db_conn() as c:
         with c.cursor() as cur:
-            cur.execute("SELECT 1 FROM datasets WHERE dataset_id=%s",(dataset_id,))
+            cur.execute("SELECT 1 FROM datasets WHERE dataset_id=%s AND deleted_at IS NULL",(dataset_id,))
             if not cur.fetchone():raise HTTPException(404,"dataset not found")
             vals.append(dataset_id)
-            cur.execute("UPDATE datasets SET "+",".join(sets)+",updated_at=now() WHERE dataset_id=%s RETURNING dataset_id,name,data_type,h3_resolution,metadata,updated_at,source,owner,version,source_format,geographic_coverage,tags,license,update_frequency,schema_definition,lineage",vals)
+            cur.execute("UPDATE datasets SET "+",".join(sets)+",updated_at=now() WHERE dataset_id=%s AND deleted_at IS NULL RETURNING dataset_id,name,data_type,h3_resolution,metadata,updated_at,source,owner,version,source_format,geographic_coverage,tags,license,update_frequency,schema_definition,lineage",vals)
             x=cur.fetchone();c.commit()
     return {"dataset_id":x[0],"name":x[1],"data_type":x[2],"h3_resolution":x[3],"metadata":x[4] or {},"updated_at":x[5],
             "source":x[6],"owner":x[7],"version":x[8],"source_format":x[9],"geographic_coverage":x[10] or {},
             "tags":x[11] or [],"license":x[12],"update_frequency":x[13],"schema":x[14] or {},"lineage":x[15] or {}}
 
-@app.delete("/datasets/{dataset_id}")
+@app.delete("/datasets/{dataset_id}",dependencies=[Depends(require_roles("admin","editor","writer"))])
 def delete_dataset(dataset_id:int):
     with db_conn() as c:
         with c.cursor() as cur:
@@ -545,7 +602,7 @@ def _execute_ingestion(payload,res,dataset_name=None):
             cur.execute("SELECT dataset_id FROM datasets WHERE name=%s AND deleted_at IS NULL",(name,));existing=cur.fetchone()
             if existing:
                 dataset_id=existing[0]
-                cur.execute("SELECT h3_resolution,data_type FROM datasets WHERE dataset_id=%s",(dataset_id,))
+                cur.execute("SELECT h3_resolution,data_type FROM datasets WHERE dataset_id=%s AND deleted_at IS NULL",(dataset_id,))
                 current=cur.fetchone()
                 if current[0]!=res or current[1]!=dtype: raise HTTPException(409,"dataset exists with different resolution or data type")
             else:
@@ -587,7 +644,7 @@ def ingestion_preview(payload:dict=Body(...),resolution:int=Query(11,ge=5,le=15)
     except HTTPException:raise
     except Exception as e:raise HTTPException(400,str(e))
 
-@app.post("/ingestion/geojson/execute")
+@app.post("/ingestion/geojson/execute",dependencies=[Depends(require_roles("admin","editor","writer"))])
 def ingestion_execute(payload:dict=Body(...),resolution:int=Query(11,ge=5,le=15),dataset:str|None=None,background:bool=Query(False)):
     if background:
         name=(dataset or "").strip()
@@ -646,7 +703,7 @@ def _dataset_rows(name,limit=10000,res=None):
     sql="""SELECT e.entity_id,d.name,d.data_type,d.h3_resolution,p.part_id,p.part_index,p.part_type,
                   p.min_lat,p.min_lng,p.max_lat,p.max_lng,a.properties,
                   h.ring_id,h.ring_type,h.h3_index,h.resolution
-           FROM entities e JOIN datasets d ON d.dataset_id=e.dataset_id
+           FROM entities e JOIN datasets d ON d.dataset_id=e.dataset_id AND d.deleted_at IS NULL
            JOIN entity_parts p ON p.entity_id=e.entity_id
            LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id
            LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
@@ -700,13 +757,13 @@ def ingestion_dataset_h3(dataset:str, resolution:int=Query(11,ge=5,le=15)):
                            FROM entity_part_h3 h
                            JOIN entity_parts p ON p.part_id=h.part_id
                            JOIN entities e ON e.entity_id=p.entity_id
-                           JOIN datasets d ON d.dataset_id=e.dataset_id
+                           JOIN datasets d ON d.dataset_id=e.dataset_id AND d.deleted_at IS NULL
                            WHERE d.name=%s
                            ORDER BY h.h3_index""",(name,))
             boundary_rows=cur.fetchall()
             cur.execute("""SELECT e.entity_id,p.part_index,h.ring_id,h.ring_type,h.h3_index,h.resolution
                            FROM entities e
-                           JOIN datasets d ON d.dataset_id=e.dataset_id
+                           JOIN datasets d ON d.dataset_id=e.dataset_id AND d.deleted_at IS NULL
                            JOIN entity_parts p ON p.entity_id=e.entity_id
                            JOIN entity_part_h3 h ON h.part_id=p.part_id
                            WHERE d.name=%s
@@ -715,7 +772,7 @@ def ingestion_dataset_h3(dataset:str, resolution:int=Query(11,ge=5,le=15)):
             cur.execute("""SELECT DISTINCT ON (e.entity_id)
                                   e.entity_id,h.h3_index,a.properties
                            FROM entities e
-                           JOIN datasets d ON d.dataset_id=e.dataset_id
+                           JOIN datasets d ON d.dataset_id=e.dataset_id AND d.deleted_at IS NULL
                            JOIN entity_parts p ON p.entity_id=e.entity_id AND p.part_index=0
                            LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id
                            LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
@@ -743,7 +800,7 @@ def ingestion_dataset_h3(dataset:str, resolution:int=Query(11,ge=5,le=15)):
 def ingestion_dataset_viewport(dataset:str,resolution:int=Query(11,ge=5,le=15),min_lat:float=Query(...),min_lng:float=Query(...),max_lat:float=Query(...),max_lng:float=Query(...),limit:int=Query(100000,ge=1,le=200000)):
     if not -90<=min_lat<=max_lat<=90 or not -180<=min_lng<=max_lng<=180: raise HTTPException(400,"invalid viewport bounds")
     sql="""SELECT e.entity_id,p.part_index,h.ring_id,h.ring_type,h.h3_index,h.resolution,a.properties
-           FROM entities e JOIN datasets d ON d.dataset_id=e.dataset_id
+           FROM entities e JOIN datasets d ON d.dataset_id=e.dataset_id AND d.deleted_at IS NULL
            JOIN entity_parts p ON p.entity_id=e.entity_id
            LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id AND h.resolution=d.h3_resolution
            LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
@@ -812,7 +869,7 @@ def advanced_query(body:QueryRequest):
     if not where:where.append("TRUE")
     sql="""SELECT DISTINCT e.entity_id,d.name,d.data_type,d.h3_resolution,p.part_id,p.part_index,p.part_type,
                   p.min_lat,p.min_lng,p.max_lat,p.max_lng,a.properties,ST_AsGeoJSON(p.geom)
-           FROM entities e JOIN datasets d ON d.dataset_id=e.dataset_id
+           FROM entities e JOIN datasets d ON d.dataset_id=e.dataset_id AND d.deleted_at IS NULL
            JOIN entity_parts p ON p.entity_id=e.entity_id
            LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id
            LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
@@ -836,7 +893,7 @@ def h3_analytics(dataset:str|None=None,resolution:int=Query(11,ge=5,le=15),limit
            FROM entity_part_h3 h
            JOIN entity_parts p ON p.part_id=h.part_id
            JOIN entities e ON e.entity_id=p.entity_id
-           JOIN datasets d ON d.dataset_id=e.dataset_id
+           JOIN datasets d ON d.dataset_id=e.dataset_id AND d.deleted_at IS NULL
            WHERE h.resolution=%s"""
     params=[resolution]
     if dataset:
@@ -858,7 +915,7 @@ def summary(res:int=Query(5,ge=5,le=15),dataset:str|None=None):
         if cached:return {"source":"redis","data":orjson.loads(cached)}
     sql="""SELECT h.h3_index,count(DISTINCT p.entity_id) FROM entity_part_h3 h
            JOIN entity_parts p ON p.part_id=h.part_id JOIN entities e ON e.entity_id=p.entity_id
-           JOIN datasets d ON d.dataset_id=e.dataset_id WHERE h.resolution=%s"""
+           JOIN datasets d ON d.dataset_id=e.dataset_id AND d.deleted_at IS NULL WHERE h.resolution=%s"""
     params=[res]
     if dataset:sql+=" AND d.name=%s";params.append(dataset)
     sql+=" GROUP BY h.h3_index ORDER BY h.h3_index"
@@ -875,7 +932,7 @@ def nearby(lat:float,lng:float,radius_m:float=Query(1000,gt=0,le=50000),limit:in
     params=[lng,lat,radius_m]
     if dataset:clauses.append("d.name=%s");params.append(dataset)
     sql="""SELECT e.entity_id,d.name,p.latitude,p.longitude,a.properties
-           FROM entity_point p JOIN entities e ON e.entity_id=p.entity_id JOIN datasets d ON d.dataset_id=e.dataset_id
+           FROM entity_point p JOIN entities e ON e.entity_id=p.entity_id JOIN datasets d ON d.dataset_id=e.dataset_id AND d.deleted_at IS NULL
            LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
            WHERE """+" AND ".join(clauses)+""" ORDER BY ST_Distance(ST_SetSRID(ST_MakePoint(p.longitude,p.latitude),4326)::geography,
            ST_SetSRID(ST_MakePoint(%s,%s),4326)::geography) LIMIT %s"""
@@ -892,7 +949,7 @@ def bbox(min_lat:float,min_lng:float,max_lat:float,max_lng:float,limit:int=Query
     if dataset:clauses.append("d.name=%s");params.append(dataset)
     params.append(limit)
     sql="""SELECT e.entity_id,d.name,p.latitude,p.longitude,a.properties
-           FROM entity_point p JOIN entities e ON e.entity_id=p.entity_id JOIN datasets d ON d.dataset_id=e.dataset_id
+           FROM entity_point p JOIN entities e ON e.entity_id=p.entity_id JOIN datasets d ON d.dataset_id=e.dataset_id AND d.deleted_at IS NULL
            LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
            WHERE """+" AND ".join(clauses)+""" LIMIT %s"""
     with db_conn() as c:
@@ -901,7 +958,7 @@ def bbox(min_lat:float,min_lng:float,max_lat:float,max_lng:float,limit:int=Query
             "properties":{"entity_id":x[0],"dataset":x[1],"properties":x[4] or {}}} for x in rows],
             "meta":{"count":len(rows),"source":"bbox"}}
 
-@app.post("/ingestion/dataset/execute")
+@app.post("/ingestion/dataset/execute",dependencies=[Depends(require_roles("admin","editor","writer"))])
 def ingestion_dataset_execute(body:dict=Body(...)):
     name=str(body.get("dataset","")).strip();res=int(body.get("resolution",11))
     rows=_dataset_rows(name,min(int(body.get("limit",10000)),10000),res)
@@ -916,7 +973,7 @@ def ingestion_dataset_execute(body:dict=Body(...)):
     if not features:return {"status":"noop","reason":"dataset contains no point parts"}
     return {"status":"noop","reason":"dataset execute is retained for compatibility; use GeoJSON execute for boundary ingestion"}
 
-@app.post("/ingestion/runs/{run_id}/rollback")
+@app.post("/ingestion/runs/{run_id}/rollback",dependencies=[Depends(require_roles("admin","editor"))])
 def rollback_ingestion(run_id:int):
     with db_conn() as c:
         with c.cursor() as cur:
@@ -939,7 +996,11 @@ def export_dataset(dataset_id:int):
     for eid,props,geom in rows:
         if geom:features.append({"type":"Feature","id":str(eid),"geometry":json.loads(geom),"properties":props or {}})
     body=json.dumps({"type":"FeatureCollection","features":features},ensure_ascii=False).encode()
-    return StreamingResponse(iter([body]),media_type="application/geo+json",headers={"Content-Disposition":f'attachment; filename="{d[0]}.geojson"'})
+    encoded=quote(f"{d[0]}.geojson",safe="")
+    headers={"Content-Disposition":f"attachment; filename=\"export.geojson\"; filename*=UTF-8''{encoded}"}
+    def stream():
+        yield body
+    return StreamingResponse(stream(),media_type="application/geo+json",headers=headers)
 
 @app.get("/ingestion/runs")
 def ingestion_runs(limit:int=Query(20,ge=1,le=100)):

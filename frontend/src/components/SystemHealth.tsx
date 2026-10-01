@@ -1,5 +1,6 @@
 import {useCallback,useEffect,useState} from 'react';
 import {Alert,Button,Chip,LinearProgress,Paper} from '@mui/material';
+import {apiFetch} from '../lib/api';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import ErrorIcon from '@mui/icons-material/Error';
@@ -10,7 +11,7 @@ type Check={key:string;label:string;group:string;ok:boolean;detail:string;ms?:nu
 async function probe(url:string):Promise<{ok:boolean;detail:string;ms:number}>{
  const started=performance.now();
  try{
-  const r=await fetch(url,{cache:'no-store'});
+  const r=await apiFetch(url,{cache:'no-store'});
   const ms=Math.round(performance.now()-started);
   let detail='HTTP '+r.status;
   try{const d=await r.json();if(d?.status)detail=d.status+(d.redis!==undefined?' · Redis '+(d.redis?'OK':'DOWN'):'')}catch{}

@@ -1,4 +1,7 @@
-import httpx,psycopg,h3,os
+import httpx
+import psycopg
+import h3
+import os
 BASE="http://api:8000"; DB=os.getenv("DATABASE_URL","postgresql://h3:h3@db:5432/h3project")
 c=h3.latlng_to_cell(13.7563,100.5018,11);b=h3.cell_to_boundary(c);lat=sum(x[0] for x in b)/6;lng=sum(x[1] for x in b)/6
 cases=[("center",13.7563,100.5018,1000),("boundary_near",lat,lng,100),("cross_cell",13.7563,100.5018,5000),("empty",20,110,100),("large",13.7563,100.5018,50000),("small",13.7563,100.5018,10)]

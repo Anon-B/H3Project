@@ -20,12 +20,13 @@
 | DATA_DICTIONARY.md | field meaning |
 | USER_GUIDE.md | end-user workflow |
 | GIT_WORKFLOW.md | branch/commit |
+| REVIEW_HARDENING_V1.3.md | hardening decisions and deferred scalability work |
 
 ## Current source of truth
 - Backend: `app/main.py`
 - Schema: `sql/schema.sql`
-- Migration: `sql/migrations/002_h3_analytics_catalog.sql`
-- Frontend: `frontend/src/App.tsx`, `styles.css`, `muiTheme.ts`
+- Migrations: `sql/migrations/` (latest hardening: `005_v1_3_hardening.sql`)
+- Frontend: `frontend/src/App.tsx`, `frontend/src/components/`, `frontend/src/lib/api.ts`, `styles.css`, `muiTheme.ts`
 - Runtime: `docker-compose.yml`
 - Tests: `tests/` และ `scripts/test_ingestion_api.py`
 

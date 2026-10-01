@@ -18,10 +18,10 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[1/4] Starting DB, Redis, API, Frontend..."
+echo "[1/5] Starting DB, Redis, API, Frontend..."
 docker-compose up -d --build
 
-echo "[2/4] Waiting for services..."
+echo "[2/5] Waiting for services..."
 for i in {1..30}; do
   if curl -fsS http://localhost:8000/health >/tmp/h3project-health.json 2>/dev/null; then
     break
@@ -29,7 +29,10 @@ for i in {1..30}; do
   sleep 2
 done
 
-echo "[3/4] Checking API health..."
+echo "[3/5] Applying database migrations..."
+docker-compose exec -T api sh /app/scripts/migrate.sh
+
+echo "[4/5] Checking API health..."
 if ! curl -fsS http://localhost:8000/health; then
   echo
   echo "ERROR: API health check failed"
@@ -38,7 +41,7 @@ if ! curl -fsS http://localhost:8000/health; then
 fi
 
 echo
-echo "[4/4] Service status:"
+echo "[5/5] Service status:"
 docker-compose ps
 
 echo
