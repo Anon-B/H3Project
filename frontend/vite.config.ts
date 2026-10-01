@@ -9,6 +9,10 @@ export default defineConfig({
     sourcemap:false,
     chunkSizeWarningLimit:1300,
     rollupOptions:{
+      onwarn(warn, handler){
+        if (warn.message.includes('contains an annotation that Rollup cannot interpret') && String(warn.id||'').includes('/node_modules/zod/')) return;
+        handler(warn);
+      },
       output:{
         manualChunks(id){
           if (!id.includes('node_modules')) return;

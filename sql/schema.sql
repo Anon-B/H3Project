@@ -144,3 +144,15 @@ CREATE INDEX idx_ingestion_h3_cells_h3 ON ingestion_h3_cells(resolution, h3_inde
 CREATE UNIQUE INDEX uq_ingestion_h3_run_cell ON ingestion_h3_cells(run_id,resolution,h3_index,feature_index,part_index,ring_id,ring_type);
 
 ANALYZE;
+
+
+CREATE TABLE IF NOT EXISTS ingestion_jobs (
+  job_id UUID PRIMARY KEY,
+  dataset TEXT NOT NULL,
+  resolution INTEGER NOT NULL CHECK (resolution BETWEEN 5 AND 15),
+  payload JSONB NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','completed','failed')),
+  result JSONB, error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ingestion_jobs_status_created ON ingestion_jobs(status,created_at);

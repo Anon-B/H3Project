@@ -20,6 +20,8 @@ API_KEY=os.getenv("API_KEY","").strip()
 JWT_SECRET=os.getenv("JWT_SECRET","").strip()
 AUTH_MODE=os.getenv("AUTH_MODE","optional").strip().lower()
 JWT_ALGORITHM=os.getenv("JWT_ALGORITHM","HS256")
+OIDC_ALGORITHMS=[x.strip() for x in os.getenv("OIDC_ALGORITHMS","RS256").split(",") if x.strip()]
+AUTH_LEEWAY=int(os.getenv("AUTH_LEEWAY_SECONDS","30"))
 OIDC_JWKS_URL=os.getenv("OIDC_JWKS_URL","").strip()
 OIDC_AUDIENCE=os.getenv("OIDC_AUDIENCE","").strip() or None
 OIDC_ISSUER=os.getenv("OIDC_ISSUER","").strip() or None
@@ -93,10 +95,10 @@ async def auth(request:Request,call_next):
             try:
                 raw=token[7:]
                 if JWT_SECRET:
-                    identity=jwt.decode(raw,JWT_SECRET,algorithms=[JWT_ALGORITHM],audience=OIDC_AUDIENCE,issuer=OIDC_ISSUER)
+                    identity=jwt.decode(raw,JWT_SECRET,algorithms=[JWT_ALGORITHM],audience=OIDC_AUDIENCE,issuer=OIDC_ISSUER,leeway=AUTH_LEEWAY,options={"require":["exp"]})
                 elif OIDC_JWKS:
                     signing_key=OIDC_JWKS.get_signing_key_from_jwt(raw).key
-                    identity=jwt.decode(raw,signing_key,algorithms=["RS256","RS384","RS512"],audience=OIDC_AUDIENCE,issuer=OIDC_ISSUER)
+                    identity=jwt.decode(raw,signing_key,algorithms=OIDC_ALGORITHMS,audience=OIDC_AUDIENCE,issuer=OIDC_ISSUER,leeway=AUTH_LEEWAY,options={"require":["exp"]})
             except jwt.PyJWTError: return ORJSONResponse({"detail":"invalid bearer token"},status_code=401)
         if API_KEY and not hmac.compare_digest(request.headers.get("x-api-key", ""),API_KEY) and identity is None:
             if AUTH_MODE=="required": return ORJSONResponse({"detail":"authentication required"},status_code=401)
@@ -461,7 +463,39 @@ def delete_dataset(dataset_id:int):
     invalidate_cache()
     return {"deleted":True,"dataset_id":x[0],"dataset":x[1]}
 
-def _insert_feature(cur,entity_id,dataset_id,feature,res,run_id=None):
+def _job_update(job_id,status,result=None,error=None):
+    with db_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("UPDATE ingestion_jobs SET status=%s,result=%s,error=%s,finished_at=CASE WHEN %s IN ('completed','failed') THEN now() ELSE finished_at END,updated_at=now() WHERE job_id=%s",(status,json.dumps(result) if result is not None else None,error,status,job_id)); c.commit()
+
+def _submit_job(job_id,payload,resolution,dataset):
+    future=executor.submit(_execute_ingestion,payload,resolution,dataset)
+    with jobs_lock: jobs[job_id]={"status":"running","dataset":dataset,"resolution":resolution,"future":future}
+    with db_conn() as c:
+        with c.cursor() as cur: cur.execute("UPDATE ingestion_jobs SET status='running',started_at=COALESCE(started_at,now()),updated_at=now() WHERE job_id=%s",(job_id,)); c.commit()
+    def finish(f):
+        try: result=f.result(); _job_update(job_id,"completed",result=result); state={"status":"completed",**result}
+        except Exception as e: _job_update(job_id,"failed",error=str(e)); state={"status":"failed","dataset":dataset,"resolution":resolution,"error":str(e)}
+        with jobs_lock: jobs[job_id]=state
+    future.add_done_callback(finish)
+
+def _recover_jobs():
+    try:
+        with db_conn() as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(8822112)")
+                if not cur.fetchone()[0]: return
+                cur.execute("SELECT job_id,payload,resolution,dataset FROM ingestion_jobs WHERE status IN ('queued','running') ORDER BY created_at")
+                rows=cur.fetchall()
+                for job_id,payload,resolution,dataset in rows: cur.execute("UPDATE ingestion_jobs SET status='queued',updated_at=now() WHERE job_id=%s",(job_id,))
+                c.commit()
+        for job_id,payload,resolution,dataset in rows: _submit_job(job_id,payload,resolution,dataset)
+    except Exception: logger.exception("job recovery failed")
+
+@app.on_event("startup")
+def recover_persistent_jobs(): _recover_jobs()
+
+def _insert_feature(cur,entity_id,dataset_id,feature,res,run_id=None,batch=None):
     geom=feature.get("geometry") or {}
     props=feature.get("properties") or {}
     parts=_geometry_parts(geom,res)
@@ -492,18 +526,13 @@ def _insert_feature(cur,entity_id,dataset_id,feature,res,run_id=None):
                            VALUES (%s,%s,%s) ON CONFLICT(entity_id) DO NOTHING""",
                         (entity_id,float(p[1]),float(p[0])))
         for ring_id,ring_type,cell in part["cells"]:
-            cur.execute("""INSERT INTO entity_part_h3(
-                           part_id,resolution,ring_id,ring_type,h3_index)
-                           VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
-                        (part_id,res,ring_id,ring_type,cell))
-            if run_id is not None:
-                cur.execute("""INSERT INTO ingestion_h3_cells(
-                               run_id,part_id,feature_id,feature_index,part_index,ring_id,
-                               ring_type,source_type,resolution,h3_index,properties)
-                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
-                            (run_id,ingestion_part_id,str(feature.get("id","")),
-                             feature.get("_index",0),part["part_index"],ring_id,ring_type,
-                             "geojson",res,cell,json.dumps(props)))
+            if batch is None:
+                cur.execute("""INSERT INTO entity_part_h3(part_id,resolution,ring_id,ring_type,h3_index) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",(part_id,res,ring_id,ring_type,cell))
+                if run_id is not None:
+                    cur.execute("""INSERT INTO ingestion_h3_cells(run_id,part_id,feature_id,feature_index,part_index,ring_id,ring_type,source_type,resolution,h3_index,properties) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",(run_id,ingestion_part_id,str(feature.get("id","")),feature.get("_index",0),part["part_index"],ring_id,ring_type,"geojson",res,cell,json.dumps(props)))
+            else:
+                batch["entity_h3"].add((part_id,res,ring_id,ring_type,cell))
+                if run_id is not None: batch["ingestion_h3"].add((run_id,part_id,str(feature.get("id","")),feature.get("_index",0),part["part_index"],ring_id,ring_type,"geojson",res,cell,json.dumps(props)))
 
 def _execute_ingestion(payload,res,dataset_name=None):
     preview=_preview(payload,res)
@@ -529,6 +558,7 @@ def _execute_ingestion(payload,res,dataset_name=None):
                         (dataset_id,"geojson",preview["feature_count"],preview["boundary_cells"],"running",
                          json.dumps({"resolution":res,"storage_mode":"boundary_h3",
                          "display_reconstruction":"h3_boundary_fill"})));run_id=cur.fetchone()[0]
+            batch={"entity_h3":set(),"ingestion_h3":set()}
             for i,f in enumerate(features):
                 f=dict(f);f["_index"]=i
                 cur.execute("INSERT INTO entities(dataset_id,ingestion_run_id) VALUES (%s,%s) RETURNING entity_id",(dataset_id,run_id))
@@ -537,7 +567,13 @@ def _execute_ingestion(payload,res,dataset_name=None):
                                VALUES (%s,%s)
                                ON CONFLICT(entity_id) DO UPDATE SET properties=EXCLUDED.properties""",
                             (eid,json.dumps(f.get("properties") or {})))
-                _insert_feature(cur,eid,dataset_id,f,res,run_id)
+                _insert_feature(cur,eid,dataset_id,f,res,run_id,batch)
+            if batch["entity_h3"]:
+                with cur.copy("COPY entity_part_h3(part_id,resolution,ring_id,ring_type,h3_index) FROM STDIN") as cp:
+                    for row in batch["entity_h3"]: cp.write_row(row)
+            if batch["ingestion_h3"]:
+                with cur.copy("COPY ingestion_h3_cells(run_id,part_id,feature_id,feature_index,part_index,ring_id,ring_type,source_type,resolution,h3_index,properties) FROM STDIN") as cp:
+                    for row in batch["ingestion_h3"]: cp.write_row(row)
             cur.execute("UPDATE ingestion_runs SET status='completed',finished_at=now() WHERE id=%s",(run_id,));c.commit()
             INGEST_COUNT.labels("completed").inc()
     invalidate_cache(name)
@@ -557,15 +593,9 @@ def ingestion_execute(payload:dict=Body(...),resolution:int=Query(11,ge=5,le=15)
         name=(dataset or "").strip()
         if not name: raise HTTPException(400,"dataset name is required")
         job_id=str(uuid.uuid4())
-        future=executor.submit(_execute_ingestion,payload,resolution,name)
-        with jobs_lock: jobs[job_id]={"status":"running","dataset":name,"resolution":resolution,"future":future}
-        def finish(f):
-            try:
-                result=f.result();state={"status":"completed",**result}
-            except Exception as e:
-                state={"status":"failed","dataset":name,"resolution":resolution,"error":str(e)}
-            with jobs_lock: jobs[job_id]=state
-        future.add_done_callback(finish)
+        with db_conn() as c:
+            with c.cursor() as cur: cur.execute("INSERT INTO ingestion_jobs(job_id,dataset,resolution,payload,status) VALUES (%s,%s,%s,%s,'queued')",(job_id,name,resolution,json.dumps(payload))); c.commit()
+        _submit_job(job_id,payload,resolution,name)
         return ORJSONResponse({"status":"accepted","job_id":job_id,"dataset":name,"resolution":resolution},status_code=202)
     return _execute_ingestion(payload,resolution,dataset)
 
@@ -631,9 +661,11 @@ def _dataset_rows(name,limit=10000,res=None):
 
 @app.get("/ingestion/jobs/{job_id}")
 def ingestion_job(job_id:str):
-    with jobs_lock: job=jobs.get(job_id)
-    if not job:raise HTTPException(404,"job not found or expired")
-    return {k:v for k,v in job.items() if k!="future"}
+    with db_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("SELECT job_id,dataset,resolution,status,result,error,created_at,started_at,finished_at FROM ingestion_jobs WHERE job_id=%s",(job_id,)); row=cur.fetchone()
+    if not row: raise HTTPException(404,"job not found")
+    return {"job_id":row[0],"dataset":row[1],"resolution":row[2],"status":row[3],"result":row[4],"error":row[5],"created_at":row[6],"started_at":row[7],"finished_at":row[8]}
 
 @app.post("/ingestion/dataset/preview")
 def ingestion_dataset_preview(body:dict=Body(...)):
