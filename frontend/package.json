@@ -9,18 +9,18 @@
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
-    "@deck.gl/core": "^9.2.0",
-    "@deck.gl/geo-layers": "^9.2.0",
-    "@deck.gl/layers": "^9.2.0",
-    "@deck.gl/mapbox": "^9.2.0",
+    "@deck.gl/core": "^9.4.0",
+    "@deck.gl/geo-layers": "^9.4.0",
+    "@deck.gl/layers": "^9.4.0",
+    "@deck.gl/mapbox": "^9.4.0",
     "@deck.gl/maplibre": "^9.4.0",
-    "@deck.gl/react": "^9.2.0",
+    "@deck.gl/react": "^9.4.0",
     "@emotion/react": "^11.14.0",
     "@emotion/styled": "^11.14.1",
     "@mui/icons-material": "^9.4.0",
     "@mui/material": "^9.4.0",
     "h3-js": "^4.1.0",
-    "maplibre-gl": "^5.16.0",
+    "maplibre-gl": "^6.11.2",
     "maplibre-gl-draw": "^1.6.9",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
@@ -32,5 +32,9 @@
     "@vitejs/plugin-react": "^5.0.4",
     "typescript": "^5.9.2",
     "vite": "^7.1.7"
+  },
+  "overrides": {
+    "fflate": "0.8.3",
+    "image-size": "2.0.4"
   }
 }
