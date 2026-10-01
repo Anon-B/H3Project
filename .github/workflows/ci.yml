@@ -1,5 +1,7 @@
 name: ci
-on: [push,pull_request]
+# CI is manual only. Pushes and pull requests do not start CI automatically.
+on:
+  workflow_dispatch:
 
 jobs:
   test:
