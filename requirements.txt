@@ -13,3 +13,4 @@ httpx
 locust
 psycopg-pool
 prometheus-client
+PyJWT>=2.9,<3

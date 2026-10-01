@@ -1,40 +1,127 @@
-import os,time,json,hmac
+import os,time,json,hmac,uuid,logging,threading
+from concurrent.futures import ThreadPoolExecutor
 import h3,orjson,redis
 from pyproj import Geod
 from shapely.geometry import shape,Polygon,MultiPolygon,mapping
 from shapely.ops import unary_union
 from psycopg_pool import ConnectionPool
 from fastapi import FastAPI,Query,HTTPException,Body,Request
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse,StreamingResponse
+from pydantic import BaseModel,Field,ConfigDict
+import jwt
+from jwt import PyJWKClient
+from prometheus_client import Counter,Histogram,generate_latest,CONTENT_TYPE_LATEST
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
 DB=os.getenv("DATABASE_URL","postgresql://h3:h3@db:5432/h3project")
 REDIS=os.getenv("REDIS_URL","redis://redis:6379/0")
 API_KEY=os.getenv("API_KEY","").strip()
+JWT_SECRET=os.getenv("JWT_SECRET","").strip()
+AUTH_MODE=os.getenv("AUTH_MODE","optional").strip().lower()
+JWT_ALGORITHM=os.getenv("JWT_ALGORITHM","HS256")
+OIDC_JWKS_URL=os.getenv("OIDC_JWKS_URL","").strip()
+OIDC_AUDIENCE=os.getenv("OIDC_AUDIENCE","").strip() or None
+OIDC_ISSUER=os.getenv("OIDC_ISSUER","").strip() or None
+OIDC_JWKS=PyJWKClient(OIDC_JWKS_URL) if OIDC_JWKS_URL else None
+RATE_LIMIT=int(os.getenv("RATE_LIMIT_PER_MINUTE","120"))
 CORS_ORIGINS=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:8080,http://127.0.0.1:8080").split(",") if x.strip()]
 GEOD=Geod(ellps="WGS84")
-app=FastAPI(title="H3Project API",version="1.1.0",default_response_class=ORJSONResponse)
+
+class IngestionRequest(BaseModel):
+    model_config=ConfigDict(extra="allow")
+    type:str
+    features:list[dict]=Field(default_factory=list)
+
+class SpatialRequest(BaseModel):
+    model_config=ConfigDict(extra="allow")
+    type:str="none"
+
+class QueryCondition(BaseModel):
+    field:str
+    operator:str="="
+    value:object=None
+
+class QueryRequest(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    dataset:str|None=None
+    conditions:list[QueryCondition]=Field(default_factory=list)
+    spatial:SpatialRequest=Field(default_factory=SpatialRequest)
+    limit:int=Field(5000,ge=1,le=20000)
+
+class DatasetPatch(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    name:str|None=None; metadata:dict|None=None; source:str|None=None; owner:str|None=None; version:str|None=None
+    source_format:str|None=None; geographic_coverage:dict|None=None; tags:list[str]|None=None; license:str|None=None
+    update_frequency:str|None=None; schema:dict|None=None; lineage:dict|None=None
+
+app=FastAPI(title="H3Project API",version="1.2.0",default_response_class=ORJSONResponse)
+logger=logging.getLogger("h3project")
+executor=ThreadPoolExecutor(max_workers=int(os.getenv("INGESTION_WORKERS","2")))
+jobs={}
+jobs_lock=threading.Lock()
+REQ_COUNT=Counter("h3_http_requests_total","HTTP requests",["method","path","status"])
+REQ_LATENCY=Histogram("h3_http_request_seconds","HTTP request latency",["method","path"])
+INGEST_COUNT=Counter("h3_ingestion_runs_total","Ingestion runs",["status"])
 rdb=redis.Redis.from_url(REDIS,decode_responses=True)
 pool=ConnectionPool(DB,min_size=2,max_size=20,open=True)
 
 @app.middleware("http")
-async def auth(request:Request,call_next):
-    if API_KEY and request.url.path not in {"/health","/ready"} and not hmac.compare_digest(request.headers.get("x-api-key", ""),API_KEY):
-        return ORJSONResponse({"detail":"invalid api key"},status_code=401)
-    return await call_next(request)
+async def observability(request:Request,call_next):
+    rid=request.headers.get("x-request-id") or str(uuid.uuid4())
+    started=time.perf_counter()
+    try:
+        response=await call_next(request)
+    except Exception:
+        REQ_COUNT.labels(request.method,request.url.path,"500").inc()
+        logger.exception("request_failed request_id=%s path=%s",rid,request.url.path)
+        raise
+    elapsed=time.perf_counter()-started
+    REQ_COUNT.labels(request.method,request.url.path,str(response.status_code)).inc()
+    REQ_LATENCY.labels(request.method,request.url.path).observe(elapsed)
+    response.headers["X-Request-ID"]=rid
+    logger.info("request request_id=%s method=%s path=%s status=%s duration_ms=%.2f",rid,request.method,request.url.path,response.status_code,elapsed*1000)
+    return response
 
-app.add_middleware(CORSMiddleware,allow_origins=CORS_ORIGINS,allow_methods=["GET","POST","PATCH","DELETE","OPTIONS"],allow_headers=["Content-Type","Authorization","X-API-Key"])
-app.add_middleware(GZipMiddleware,minimum_size=1000)
+@app.middleware("http")
+async def auth(request:Request,call_next):
+    public={"/health","/ready","/metrics","/docs","/openapi.json","/redoc"}
+    if request.url.path not in public:
+        identity=None
+        token=request.headers.get("authorization","")
+        if token.lower().startswith("bearer "):
+            try:
+                raw=token[7:]
+                if JWT_SECRET:
+                    identity=jwt.decode(raw,JWT_SECRET,algorithms=[JWT_ALGORITHM],audience=OIDC_AUDIENCE,issuer=OIDC_ISSUER)
+                elif OIDC_JWKS:
+                    signing_key=OIDC_JWKS.get_signing_key_from_jwt(raw).key
+                    identity=jwt.decode(raw,signing_key,algorithms=["RS256","RS384","RS512"],audience=OIDC_AUDIENCE,issuer=OIDC_ISSUER)
+            except jwt.PyJWTError: return ORJSONResponse({"detail":"invalid bearer token"},status_code=401)
+        if API_KEY and not hmac.compare_digest(request.headers.get("x-api-key", ""),API_KEY) and identity is None:
+            if AUTH_MODE=="required": return ORJSONResponse({"detail":"authentication required"},status_code=401)
+        request.state.identity=identity or {}
+        if AUTH_MODE=="required" and not identity and not API_KEY: return ORJSONResponse({"detail":"authentication required"},status_code=401)
+        if request.method in {"POST","PATCH","DELETE"} and AUTH_MODE=="required":
+            roles=set(request.state.identity.get("roles",[]))
+            roles.update(request.state.identity.get("groups",[]) or [])
+            roles.update((request.state.identity.get("realm_access") or {}).get("roles",[]) or [])
+            if not roles.intersection({"admin","editor","writer"}): return ORJSONResponse({"detail":"write role required"},status_code=403)
+        if RATE_LIMIT>0 and redis_ok():
+            subject=str((identity or {}).get("sub") or request.client.host or "anonymous")
+            bucket=int(time.time()//60);key=f"rate:{subject}:{bucket}"
+            n=int(rdb.incr(key));rdb.expire(key,61)
+            if n>RATE_LIMIT:return ORJSONResponse({"detail":"rate limit exceeded"},status_code=429,headers={"Retry-After":"60"})
+    return await call_next(request)
 
 def db_conn(): return pool.connection()
 def redis_ok():
     try:return bool(rdb.ping())
     except Exception:return False
 
-def invalidate_cache():
+def invalidate_cache(dataset=None):
     try:
-        for key in rdb.scan_iter(match="h3:*"): rdb.delete(key)
+        for key in rdb.scan_iter(match=(f"h3:*:{dataset}:*" if dataset else "h3:*")): rdb.delete(key)
     except Exception: pass
 
 def _coord_xy(value):
@@ -295,6 +382,10 @@ def metrics():
             cur.execute("SELECT COALESCE(sum(pg_indexes_size(relid)),0) FROM pg_catalog.pg_statio_user_tables");index_size=cur.fetchone()[0]
     return {"database_bytes":db_size,"user_tables_bytes":table_size,"user_indexes_bytes":index_size,"redis":redis_ok()}
 
+@app.get("/metrics/prometheus")
+def prometheus_metrics():
+    return StreamingResponse(iter([generate_latest()]),media_type=CONTENT_TYPE_LATEST)
+
 @app.get("/ingestion/datasets")
 def ingestion_datasets(limit:int=Query(100,ge=1,le=500)):
     sql="""SELECT d.dataset_id,d.name,d.data_type,d.h3_resolution,d.metadata,d.created_at,d.updated_at,
@@ -304,7 +395,7 @@ def ingestion_datasets(limit:int=Query(100,ge=1,le=500)):
            FROM datasets d LEFT JOIN entities e ON e.dataset_id=d.dataset_id
            LEFT JOIN entity_parts p ON p.entity_id=e.entity_id
            LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id
-           GROUP BY d.dataset_id ORDER BY d.name LIMIT %s"""
+           WHERE d.deleted_at IS NULL GROUP BY d.dataset_id ORDER BY d.name LIMIT %s"""
     with db_conn() as c:
         with c.cursor() as cur:cur.execute(sql,(limit,));rows=cur.fetchall()
     return {"datasets":[{"dataset_id":x[0],"dataset":x[1],"data_type":x[2],"h3_resolution":x[3],
@@ -323,7 +414,7 @@ def dataset_detail(dataset_id:int):
            FROM datasets d LEFT JOIN entities e ON e.dataset_id=d.dataset_id
            LEFT JOIN entity_parts p ON p.entity_id=e.entity_id
            LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id
-           WHERE d.dataset_id=%s GROUP BY d.dataset_id"""
+           WHERE d.dataset_id=%s AND d.deleted_at IS NULL GROUP BY d.dataset_id"""
     with db_conn() as c:
         with c.cursor() as cur:cur.execute(sql,(dataset_id,));x=cur.fetchone()
     if not x:raise HTTPException(404,"dataset not found")
@@ -334,7 +425,7 @@ def dataset_detail(dataset_id:int):
             "boundary_h3_count":x[19],"storage_mode":"boundary_h3"}
 
 @app.patch("/datasets/{dataset_id}")
-def update_dataset(dataset_id:int,body:dict=Body(...)):
+def update_dataset(dataset_id:int,body:DatasetPatch):
     allowed={"name","metadata","h3_resolution","source","owner","version","source_format","geographic_coverage","tags","license","update_frequency","schema","lineage"};changes={k:v for k,v in body.items() if k in allowed}
     if not changes:raise HTTPException(400,"nothing to update")
     if "h3_resolution" in changes and not 5<=int(changes["h3_resolution"])<=15:
@@ -364,7 +455,7 @@ def update_dataset(dataset_id:int,body:dict=Body(...)):
 def delete_dataset(dataset_id:int):
     with db_conn() as c:
         with c.cursor() as cur:
-            cur.execute("DELETE FROM datasets WHERE dataset_id=%s RETURNING dataset_id,name",(dataset_id,));x=cur.fetchone()
+            cur.execute("UPDATE datasets SET deleted_at=now(),updated_at=now() WHERE dataset_id=%s AND deleted_at IS NULL RETURNING dataset_id,name",(dataset_id,));x=cur.fetchone()
             if not x:raise HTTPException(404,"dataset not found")
             c.commit()
     invalidate_cache()
@@ -409,7 +500,7 @@ def _insert_feature(cur,entity_id,dataset_id,feature,res,run_id=None):
                 cur.execute("""INSERT INTO ingestion_h3_cells(
                                run_id,part_id,feature_id,feature_index,part_index,ring_id,
                                ring_type,source_type,resolution,h3_index,properties)
-                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
                             (run_id,ingestion_part_id,str(feature.get("id","")),
                              feature.get("_index",0),part["part_index"],ring_id,ring_type,
                              "geojson",res,cell,json.dumps(props)))
@@ -422,7 +513,7 @@ def _execute_ingestion(payload,res,dataset_name=None):
     dtype=_data_type(features)
     with db_conn() as c:
         with c.cursor() as cur:
-            cur.execute("SELECT dataset_id FROM datasets WHERE name=%s",(name,));existing=cur.fetchone()
+            cur.execute("SELECT dataset_id FROM datasets WHERE name=%s AND deleted_at IS NULL",(name,));existing=cur.fetchone()
             if existing:
                 dataset_id=existing[0]
                 cur.execute("SELECT h3_resolution,data_type FROM datasets WHERE dataset_id=%s",(dataset_id,))
@@ -448,7 +539,8 @@ def _execute_ingestion(payload,res,dataset_name=None):
                             (eid,json.dumps(f.get("properties") or {})))
                 _insert_feature(cur,eid,dataset_id,f,res,run_id)
             cur.execute("UPDATE ingestion_runs SET status='completed',finished_at=now() WHERE id=%s",(run_id,));c.commit()
-    invalidate_cache()
+            INGEST_COUNT.labels("completed").inc()
+    invalidate_cache(name)
     return {"run_id":run_id,"status":"completed","dataset":name,"resolution":res,
             "feature_count":preview["feature_count"],"stored_boundary_cells":preview["boundary_cells"],
             "display_cells":preview["display_cells"],"storage_mode":"boundary_h3"}
@@ -460,7 +552,21 @@ def ingestion_preview(payload:dict=Body(...),resolution:int=Query(11,ge=5,le=15)
     except Exception as e:raise HTTPException(400,str(e))
 
 @app.post("/ingestion/geojson/execute")
-def ingestion_execute(payload:dict=Body(...),resolution:int=Query(11,ge=5,le=15),dataset:str|None=None):
+def ingestion_execute(payload:dict=Body(...),resolution:int=Query(11,ge=5,le=15),dataset:str|None=None,background:bool=Query(False)):
+    if background:
+        name=(dataset or "").strip()
+        if not name: raise HTTPException(400,"dataset name is required")
+        job_id=str(uuid.uuid4())
+        future=executor.submit(_execute_ingestion,payload,resolution,name)
+        with jobs_lock: jobs[job_id]={"status":"running","dataset":name,"resolution":resolution,"future":future}
+        def finish(f):
+            try:
+                result=f.result();state={"status":"completed",**result}
+            except Exception as e:
+                state={"status":"failed","dataset":name,"resolution":resolution,"error":str(e)}
+            with jobs_lock: jobs[job_id]=state
+        future.add_done_callback(finish)
+        return ORJSONResponse({"status":"accepted","job_id":job_id,"dataset":name,"resolution":resolution},status_code=202)
     return _execute_ingestion(payload,resolution,dataset)
 
 def _entity_parts(entity_id,res=None):
@@ -522,6 +628,12 @@ def _dataset_rows(name,limit=10000,res=None):
         sql+=" LIMIT %s";params.append(limit*100)
     with db_conn() as c:
         with c.cursor() as cur:cur.execute(sql,params);return cur.fetchall()
+
+@app.get("/ingestion/jobs/{job_id}")
+def ingestion_job(job_id:str):
+    with jobs_lock: job=jobs.get(job_id)
+    if not job:raise HTTPException(404,"job not found or expired")
+    return {k:v for k,v in job.items() if k!="future"}
 
 @app.post("/ingestion/dataset/preview")
 def ingestion_dataset_preview(body:dict=Body(...)):
@@ -595,8 +707,35 @@ def ingestion_dataset_h3(dataset:str, resolution:int=Query(11,ge=5,le=15)):
             "boundary_parts":boundary_parts,"entity_h3":entity_h3,
             "display_mode":"frontend_boundary_fill"}
 
+@app.get("/ingestion/dataset/viewport")
+def ingestion_dataset_viewport(dataset:str,resolution:int=Query(11,ge=5,le=15),min_lat:float=Query(...),min_lng:float=Query(...),max_lat:float=Query(...),max_lng:float=Query(...),limit:int=Query(100000,ge=1,le=200000)):
+    if not -90<=min_lat<=max_lat<=90 or not -180<=min_lng<=max_lng<=180: raise HTTPException(400,"invalid viewport bounds")
+    sql="""SELECT e.entity_id,p.part_index,h.ring_id,h.ring_type,h.h3_index,h.resolution,a.properties
+           FROM entities e JOIN datasets d ON d.dataset_id=e.dataset_id
+           JOIN entity_parts p ON p.entity_id=e.entity_id
+           LEFT JOIN entity_part_h3 h ON h.part_id=p.part_id AND h.resolution=d.h3_resolution
+           LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id
+           WHERE d.name=%s AND d.deleted_at IS NULL
+             AND ST_Intersects(p.geom,ST_MakeEnvelope(%s,%s,%s,%s,4326))
+           ORDER BY e.entity_id,p.part_index,h.ring_id,h.h3_index LIMIT %s"""
+    with db_conn() as c:
+        with c.cursor() as cur:cur.execute(sql,(dataset,min_lng,min_lat,max_lng,max_lat,limit));rows=cur.fetchall()
+    if not rows:raise HTTPException(404,"dataset not found or viewport empty")
+    parts={};entities={};cells=set()
+    for eid,part_index,ring_id,ring_type,cell,res,props in rows:
+        entities.setdefault(eid,{"entity_id":eid,"properties":props or {}})
+        part=parts.setdefault((eid,part_index),{"entity_id":eid,"part_index":part_index,"resolution":res or resolution,"rings":{}})
+        if cell:
+            cells.add(cell);ring=part["rings"].setdefault(ring_id,{"ring_id":ring_id,"ring_type":ring_type,"h3":[]});ring["h3"].append(cell)
+    entity_h3=[]
+    for x in entities.values():
+        first=next((c for (eid,_),p in parts.items() if eid==x["entity_id"] for r in p["rings"].values() for c in r["h3"]),None)
+        if first: entity_h3.append({"entity_id":x["entity_id"],"h3_index":first,"properties":x["properties"]})
+    return {"dataset":dataset,"resolution":resolution,"h3":sorted(cells),"boundary_h3":sorted(cells),"boundary_parts":list(parts.values()),"entity_h3":entity_h3,"meta":{"viewport":True,"count":len(cells)}}
+
 @app.post("/query")
-def advanced_query(body:dict=Body(...)):
+def advanced_query(body:QueryRequest):
+    body=body.model_dump()
     dataset=str(body.get("dataset") or "").strip() or None
     conditions=body.get("conditions") or [];spatial=body.get("spatial") or {}
     limit=max(1,min(int(body.get("limit",5000)),20000));where=[];params=[]
@@ -745,6 +884,31 @@ def ingestion_dataset_execute(body:dict=Body(...)):
     if not features:return {"status":"noop","reason":"dataset contains no point parts"}
     return {"status":"noop","reason":"dataset execute is retained for compatibility; use GeoJSON execute for boundary ingestion"}
 
+@app.post("/ingestion/runs/{run_id}/rollback")
+def rollback_ingestion(run_id:int):
+    with db_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("SELECT dataset_id,status FROM ingestion_runs WHERE id=%s FOR UPDATE",(run_id,));run=cur.fetchone()
+            if not run:raise HTTPException(404,"run not found")
+            if run[1] not in {"completed","failed"}:raise HTTPException(409,"run cannot be rolled back")
+            cur.execute("DELETE FROM entities WHERE ingestion_run_id=%s",(run_id,))
+            cur.execute("UPDATE ingestion_runs SET status='rolled_back',finished_at=now() WHERE id=%s",(run_id,))
+            c.commit()
+    invalidate_cache();return {"status":"rolled_back","run_id":run_id}
+
+@app.get("/datasets/{dataset_id}/export")
+def export_dataset(dataset_id:int):
+    with db_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("SELECT name FROM datasets WHERE dataset_id=%s AND deleted_at IS NULL",(dataset_id,));d=cur.fetchone()
+            if not d:raise HTTPException(404,"dataset not found")
+            cur.execute("""SELECT e.entity_id,a.properties,ST_AsGeoJSON(p.geom) FROM entities e JOIN entity_parts p ON p.entity_id=e.entity_id LEFT JOIN entity_attributes a ON a.entity_id=e.entity_id WHERE e.dataset_id=%s ORDER BY e.entity_id,p.part_index""",(dataset_id,));rows=cur.fetchall()
+    features=[]
+    for eid,props,geom in rows:
+        if geom:features.append({"type":"Feature","id":str(eid),"geometry":json.loads(geom),"properties":props or {}})
+    body=json.dumps({"type":"FeatureCollection","features":features},ensure_ascii=False).encode()
+    return StreamingResponse(iter([body]),media_type="application/geo+json",headers={"Content-Disposition":f'attachment; filename="{d[0]}.geojson"'})
+
 @app.get("/ingestion/runs")
 def ingestion_runs(limit:int=Query(20,ge=1,le=100)):
     with db_conn() as c:
@@ -756,11 +920,11 @@ def ingestion_runs(limit:int=Query(20,ge=1,le=100)):
 def ingestion_run(run_id:int):
     with db_conn() as c:
         with c.cursor() as cur:
-            cur.execute("SELECT id,source_type,input_feature_count,output_cell_count,status,created_at,metadata FROM ingestion_runs WHERE id=%s",(run_id,));x=cur.fetchone()
+            cur.execute("SELECT id,source_type,input_feature_count,output_cell_count,status,created_at,finished_at,metadata FROM ingestion_runs WHERE id=%s",(run_id,));x=cur.fetchone()
             if not x:raise HTTPException(404,"run not found")
             cur.execute("""SELECT resolution,ring_type,count(*),count(DISTINCT h3_index)
                            FROM ingestion_h3_cells WHERE run_id=%s GROUP BY resolution,ring_type ORDER BY resolution,ring_type""",(run_id,));stats=cur.fetchall()
     return {"id":x[0],"source_type":x[1],"input_feature_count":x[2],"output_cell_count":x[3],
-            "status":x[4],"created_at":x[5],"metadata":x[6],
+            "status":x[4],"created_at":x[5],"finished_at":x[6],"metadata":x[7],
             "h3_storage":[{"resolution":a,"ring_type":b,"rows":c,"unique_cells":d} for a,b,c,d in stats],
             "storage_mode":"boundary_h3"}

@@ -18,7 +18,8 @@ CREATE TABLE datasets (
   license TEXT NOT NULL DEFAULT '',
   update_frequency TEXT NOT NULL DEFAULT '',
   schema_definition JSONB NOT NULL DEFAULT '{}'::jsonb,
-  lineage JSONB NOT NULL DEFAULT '{}'::jsonb
+  lineage JSONB NOT NULL DEFAULT '{}'::jsonb,
+  deleted_at TIMESTAMPTZ
 );
 
 CREATE TABLE entities (
@@ -26,6 +27,7 @@ CREATE TABLE entities (
   dataset_id BIGINT NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE
 );
 CREATE INDEX idx_entities_dataset ON entities(dataset_id, entity_id);
+CREATE INDEX idx_datasets_active_name ON datasets(name) WHERE deleted_at IS NULL;
 
 CREATE TABLE entity_parts (
   part_id BIGSERIAL PRIMARY KEY,
@@ -139,5 +141,6 @@ CREATE TABLE ingestion_h3_cells (
 );
 CREATE INDEX idx_ingestion_h3_cells_run ON ingestion_h3_cells(run_id);
 CREATE INDEX idx_ingestion_h3_cells_h3 ON ingestion_h3_cells(resolution, h3_index);
+CREATE UNIQUE INDEX uq_ingestion_h3_run_cell ON ingestion_h3_cells(run_id,resolution,h3_index,feature_index,part_index,ring_id,ring_type);
 
 ANALYZE;
